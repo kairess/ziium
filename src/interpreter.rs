@@ -12,7 +12,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
+use flate2::read::GzDecoder;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{self, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::{self, File};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::rc::Rc;
@@ -2251,27 +2255,93 @@ fn select_torch_device() -> Device {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_mnist_bundle() -> Result<tch::vision::dataset::Dataset, RuntimeError> {
-    const CANDIDATE_DIRS: [&str; 2] = ["data", "data/MNIST/raw"];
+    let download_dir = Path::new("data/MNIST/raw");
+    let last_error = if download_dir.exists() {
+        tch::vision::mnist::load_dir(download_dir)
+            .err()
+            .map(|err| (download_dir.display().to_string(), err))
+    } else {
+        None
+    };
 
-    let mut last_error = None;
-    for dir in CANDIDATE_DIRS {
-        if !Path::new(dir).exists() {
+    download_mnist_files(download_dir).map_err(|download_err| {
+        let download_dir = download_dir.display();
+        match &last_error {
+            Some((dir, err)) => RuntimeError::new(format!(
+                "MNIST 데이터를 `{download_dir}`에서 불러오지 못해 자동 다운로드를 시도했지만 실패했습니다. 마지막 실패: `{dir}` - {err}, 다운로드 오류: {download_err}"
+            )),
+            None => RuntimeError::new(format!(
+                "MNIST 데이터가 `{download_dir}`에 없어 자동 다운로드를 시도했지만 실패했습니다. 다운로드 오류: {download_err}"
+            )),
+        }
+    })?;
+
+    tch::vision::mnist::load_dir(download_dir).map_err(|err| {
+        RuntimeError::new(format!(
+            "MNIST 데이터를 자동 다운로드한 뒤에도 불러오지 못했습니다. 대상 경로: `{}` - {err}",
+            download_dir.display()
+        ))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn download_mnist_files(dir: &Path) -> Result<(), RuntimeError> {
+    const BASE_URL: &str = "https://ossci-datasets.s3.amazonaws.com/mnist";
+    const FILES: [&str; 4] = [
+        "train-images-idx3-ubyte",
+        "train-labels-idx1-ubyte",
+        "t10k-images-idx3-ubyte",
+        "t10k-labels-idx1-ubyte",
+    ];
+
+    fs::create_dir_all(dir).map_err(|err| {
+        RuntimeError::new(format!(
+            "MNIST 저장 디렉터리를 만들지 못했습니다. `{}` - {err}",
+            dir.display()
+        ))
+    })?;
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|err| RuntimeError::new(format!("MNIST 다운로드 클라이언트 생성 실패: {err}")))?;
+
+    for file_name in FILES {
+        let destination = dir.join(file_name);
+        if destination.exists() {
             continue;
         }
-        match tch::vision::mnist::load_dir(dir) {
-            Ok(dataset) => return Ok(dataset),
-            Err(err) => last_error = Some((dir, err)),
-        }
+
+        let url = format!("{BASE_URL}/{file_name}.gz");
+        let response = client
+            .get(&url)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|err| {
+                RuntimeError::new(format!(
+                    "MNIST 파일을 내려받지 못했습니다. `{file_name}` ({url}) - {err}"
+                ))
+            })?;
+        let bytes = response.bytes().map_err(|err| {
+            RuntimeError::new(format!(
+                "MNIST 다운로드 응답을 읽지 못했습니다. `{file_name}` ({url}) - {err}"
+            ))
+        })?;
+
+        let mut decoder = GzDecoder::new(bytes.as_ref());
+        let mut output = File::create(&destination).map_err(|err| {
+            RuntimeError::new(format!(
+                "MNIST 파일을 저장하지 못했습니다. `{}` - {err}",
+                destination.display()
+            ))
+        })?;
+        std::io::copy(&mut decoder, &mut output).map_err(|err| {
+            RuntimeError::new(format!(
+                "MNIST 압축 해제에 실패했습니다. `{file_name}` - {err}"
+            ))
+        })?;
     }
 
-    match last_error {
-        Some((dir, err)) => Err(RuntimeError::new(format!(
-            "MNIST 데이터를 불러오지 못했습니다. 시도 경로: `data`, `data/MNIST/raw` (마지막 실패: `{dir}` - {err})"
-        ))),
-        None => Err(RuntimeError::new(
-            "MNIST 데이터를 불러오지 못했습니다. `data` 또는 `data/MNIST/raw` 경로를 확인하세요.",
-        )),
-    }
+    Ok(())
 }
 
 fn expect_arity<const N: usize>(name: &str, args: Vec<Value>) -> Result<[Value; N], RuntimeError> {
