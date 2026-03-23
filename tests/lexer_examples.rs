@@ -96,6 +96,58 @@ fn lexes_function_header_with_function_topic() {
 }
 
 #[test]
+fn keeps_function_name_that_ends_with_ga() {
+    assert_lex(
+        "한배치평가 함수는 입력을 받아",
+        &[
+            "IDENT(\"한배치평가\")",
+            "Function(\"함수\")",
+            "FunctionTopic(\"는\")",
+            "IDENT(\"입력\")",
+            "Object(\"을\")",
+            "Receive(\"받아\")",
+            "NEWLINE",
+            "EOF",
+        ],
+    );
+}
+
+#[test]
+fn keeps_call_callee_name_that_ends_with_ga() {
+    assert_lex(
+        "평가결과를 전체평가(평가입력)으로 바꾼다",
+        &[
+            "IDENT(\"평가결과\")",
+            "Object(\"를\")",
+            "IDENT(\"전체평가\")",
+            "LParen(\"(\")",
+            "IDENT(\"평가입력\")",
+            "RParen(\")\")",
+            "Direction(\"으로\")",
+            "Change(\"바꾼다\")",
+            "NEWLINE",
+            "EOF",
+        ],
+    );
+}
+
+#[test]
+fn splits_object_particle_after_genitive_property_name() {
+    assert_lex(
+        "손실의 값을 출력한다",
+        &[
+            "IDENT(\"손실\")",
+            "Gen(\"의\")",
+            "IDENT(\"값\")",
+            "Object(\"을\")",
+            "Print(\"출력한다\")",
+            "NEWLINE",
+            "EOF",
+        ],
+    );
+}
+
+#[test]
 fn lexes_keyword_message_statement() {
     assert_lex(
         "과일들에 \"감\" 추가",

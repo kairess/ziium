@@ -11,7 +11,16 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+use tch::nn::{self, Module, OptimizerConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use tch::{Device, Kind, Tensor, no_grad};
 
 type EnvRef = Rc<RefCell<Environment>>;
 
@@ -58,16 +67,93 @@ pub struct UserFunction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Length,
+    CurrentTimeSeconds,
     Push,
     PopLast,
     ToString,
     ToInt,
     ToFloat,
+    FlattenLayer,
+    LinearLayer,
+    ReluLayer,
+    SequentialNetwork,
+    BuildMnistDataset,
+    BuildDataLoader,
+    CrossEntropyLoss,
+    AdamOptimizer,
+    ZeroGrad,
+    Forward,
+    ComputeLoss,
+    Backward,
+    OptimizerStep,
+    SetTrainMode,
+    SetEvalMode,
+    FetchBatch,
+    ArgMax,
+    CountEqual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostValue {
     Canvas,
+    TorchLayer(TorchLayerKind),
+    TorchDataset(usize),
+    TorchDataLoader(usize),
+    TorchBatch(usize),
+    TorchModel(usize),
+    TorchModelParameters(usize),
+    TorchLossFunction(TorchLossKind),
+    TorchOptimizer(usize),
+    TorchTensor(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorchLayerKind {
+    Flatten,
+    Relu,
+    Linear { in_features: i64, out_features: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorchLossKind {
+    CrossEntropy,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchDataset {
+    images: Tensor,
+    labels: Tensor,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchDataLoader {
+    dataset: usize,
+    batch_size: i64,
+    order: Tensor,
+    len: i64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchBatch {
+    images: Tensor,
+    labels: Tensor,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchModel {
+    var_store: nn::VarStore,
+    network: nn::Sequential,
+    is_training: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchOptimizer {
+    optimizer: nn::Optimizer,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -118,6 +204,20 @@ struct Interpreter {
     current_canvas_commands: Vec<CanvasCommand>,
     canvas_frames: Vec<CanvasFrame>,
     events: Vec<ExecutionEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
+    run_started_at: Instant,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_datasets: Vec<TorchDataset>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_loaders: Vec<TorchDataLoader>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_batches: Vec<TorchBatch>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_models: Vec<RefCell<TorchModel>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_optimizers: Vec<RefCell<TorchOptimizer>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_tensors: Vec<Tensor>,
 }
 
 #[derive(Debug)]
@@ -203,6 +303,20 @@ impl Interpreter {
             current_canvas_commands: Vec::new(),
             canvas_frames: Vec::new(),
             events: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            run_started_at: Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_datasets: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_loaders: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_batches: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_models: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_optimizers: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_tensors: Vec::new(),
         }
     }
 
@@ -211,6 +325,10 @@ impl Interpreter {
         self.current_canvas_commands.clear();
         self.canvas_frames.clear();
         self.events.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.run_started_at = Instant::now();
+        }
         match self.execute_block(&program.statements, self.globals.clone())? {
             ExecSignal::Continue => {
                 self.finish_canvas_frame();
@@ -660,6 +778,19 @@ impl Interpreter {
                     )),
                 }
             }
+            BuiltinFunction::CurrentTimeSeconds => {
+                let [] = expect_arity::<0>("현재시간초", args)?;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Err(RuntimeError::new(
+                        "현재 환경에서는 `현재시간초`를 사용할 수 없습니다.",
+                    ))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Ok(Value::Float(self.run_started_at.elapsed().as_secs_f64()))
+                }
+            }
             BuiltinFunction::Push => {
                 let [list, value] = expect_arity::<2>("추가", args)?;
                 match list {
@@ -715,6 +846,491 @@ impl Interpreter {
                     )),
                 }
             }
+            BuiltinFunction::FlattenLayer => {
+                let [] = expect_arity::<0>("평탄화", args)?;
+                Ok(Value::Host(HostValue::TorchLayer(TorchLayerKind::Flatten)))
+            }
+            BuiltinFunction::LinearLayer => {
+                let [in_features, out_features] = expect_arity::<2>("선형층", args)?;
+                let in_features = expect_int("선형층", in_features)?;
+                let out_features = expect_int("선형층", out_features)?;
+                Ok(Value::Host(HostValue::TorchLayer(TorchLayerKind::Linear {
+                    in_features,
+                    out_features,
+                })))
+            }
+            BuiltinFunction::ReluLayer => {
+                let [] = expect_arity::<0>("렐루", args)?;
+                Ok(Value::Host(HostValue::TorchLayer(TorchLayerKind::Relu)))
+            }
+            BuiltinFunction::SequentialNetwork => {
+                let [layers] = expect_arity::<1>("순차신경망", args)?;
+                self.build_sequential_network(layers)
+            }
+            BuiltinFunction::BuildMnistDataset => {
+                let [config] = expect_arity::<1>("숫자손글씨데이터셋", args)?;
+                self.build_mnist_dataset(config)
+            }
+            BuiltinFunction::BuildDataLoader => {
+                let [config] = expect_arity::<1>("데이터로더", args)?;
+                self.build_data_loader(config)
+            }
+            BuiltinFunction::CrossEntropyLoss => {
+                let [] = expect_arity::<0>("교차엔트로피손실", args)?;
+                Ok(Value::Host(HostValue::TorchLossFunction(
+                    TorchLossKind::CrossEntropy,
+                )))
+            }
+            BuiltinFunction::AdamOptimizer => {
+                let [parameters, learning_rate] = expect_arity::<2>("아담", args)?;
+                self.build_adam_optimizer(parameters, learning_rate)
+            }
+            BuiltinFunction::ZeroGrad => {
+                let [optimizer] = expect_arity::<1>("기울기초기화", args)?;
+                self.zero_grad_optimizer(optimizer)
+            }
+            BuiltinFunction::Forward => {
+                let [model, input] = expect_arity::<2>("순전파", args)?;
+                self.forward_model(model, input)
+            }
+            BuiltinFunction::ComputeLoss => {
+                let [loss_fn, logits, labels] = expect_arity::<3>("손실계산", args)?;
+                self.compute_loss(loss_fn, logits, labels)
+            }
+            BuiltinFunction::Backward => {
+                let [loss] = expect_arity::<1>("역전파", args)?;
+                self.backward_tensor(loss)
+            }
+            BuiltinFunction::OptimizerStep => {
+                let [optimizer] = expect_arity::<1>("매개변수갱신", args)?;
+                self.step_optimizer(optimizer)
+            }
+            BuiltinFunction::SetTrainMode => {
+                let [model] = expect_arity::<1>("학습모드로바꾸기", args)?;
+                self.set_model_mode(model, true)
+            }
+            BuiltinFunction::SetEvalMode => {
+                let [model] = expect_arity::<1>("평가모드로바꾸기", args)?;
+                self.set_model_mode(model, false)
+            }
+            BuiltinFunction::FetchBatch => {
+                let [loader, batch_index] = expect_arity::<2>("배치가져오기", args)?;
+                self.fetch_batch(loader, batch_index)
+            }
+            BuiltinFunction::ArgMax => {
+                let [tensor, dim] = expect_arity::<2>("최대인덱스", args)?;
+                self.argmax_tensor(tensor, dim)
+            }
+            BuiltinFunction::CountEqual => {
+                let [left, right] = expect_arity::<2>("같은값개수", args)?;
+                self.count_equal(left, right)
+            }
+        }
+    }
+
+    fn build_sequential_network(&mut self, layers: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = layers;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let layer_values = expect_list_values("순차신경망", layers)?;
+            let mut kinds = Vec::with_capacity(layer_values.len());
+            for value in layer_values {
+                match value {
+                    Value::Host(HostValue::TorchLayer(kind)) => kinds.push(kind),
+                    _ => {
+                        return Err(RuntimeError::new(
+                            "`순차신경망`에는 레이어 목록만 전달할 수 있습니다.",
+                        ));
+                    }
+                }
+            }
+
+            let device = Device::cuda_if_available();
+            let var_store = nn::VarStore::new(device);
+            let path = var_store.root();
+            let mut network = nn::seq();
+            for (index, kind) in kinds.into_iter().enumerate() {
+                match kind {
+                    TorchLayerKind::Flatten => {
+                        network = network.add_fn(|xs| xs.flatten(1, -1));
+                    }
+                    TorchLayerKind::Relu => {
+                        network = network.add_fn(|xs| xs.relu());
+                    }
+                    TorchLayerKind::Linear {
+                        in_features,
+                        out_features,
+                    } => {
+                        let name = format!("linear{index}");
+                        network = network.add(nn::linear(
+                            &path / name,
+                            in_features,
+                            out_features,
+                            Default::default(),
+                        ));
+                    }
+                }
+            }
+
+            Ok(self.register_model(TorchModel {
+                var_store,
+                network,
+                is_training: true,
+            }))
+        }
+    }
+
+    fn build_mnist_dataset(&mut self, config: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let record = expect_record("숫자손글씨데이터셋", config)?;
+            let is_train = expect_bool_field(&record, "학습용")?;
+            let candidate_dirs = ["data", "data/MNIST/raw"];
+            let mut mnist = None;
+            let mut last_error = None;
+            for dir in candidate_dirs {
+                if !Path::new(dir).exists() {
+                    continue;
+                }
+                match tch::vision::mnist::load_dir(dir) {
+                    Ok(loaded) => {
+                        mnist = Some(loaded);
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some((dir.to_string(), err.to_string()));
+                    }
+                }
+            }
+            let mnist = mnist.ok_or_else(|| {
+                if let Some((dir, err)) = last_error {
+                    RuntimeError::new(format!(
+                        "MNIST 데이터를 불러오지 못했습니다. 시도 경로: `data`, `data/MNIST/raw` (마지막 실패: `{dir}` - {err})"
+                    ))
+                } else {
+                    RuntimeError::new(
+                        "MNIST 데이터를 불러오지 못했습니다. `data` 또는 `data/MNIST/raw` 경로를 확인하세요."
+                            .to_string(),
+                    )
+                }
+            })?;
+
+            let (images, labels) = if is_train {
+                (mnist.train_images, mnist.train_labels)
+            } else {
+                (mnist.test_images, mnist.test_labels)
+            };
+            Ok(self.register_dataset(TorchDataset { images, labels }))
+        }
+    }
+
+    fn build_data_loader(&mut self, config: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let record = expect_record("데이터로더", config)?;
+            let dataset_id = expect_host_id_field(&record, "데이터셋", |value| match value {
+                Value::Host(HostValue::TorchDataset(id)) => Some(*id),
+                _ => None,
+            })?;
+            let batch_size = expect_int_field(&record, "배치크기")?;
+            if batch_size <= 0 {
+                return Err(RuntimeError::new("`배치크기`는 1 이상의 정수여야 합니다."));
+            }
+            let shuffle = expect_bool_field(&record, "섞기여부")?;
+            let dataset = self
+                .torch_datasets
+                .get(dataset_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터셋입니다."))?;
+            let count = dataset.labels.size().first().copied().unwrap_or(0);
+            let len = (count + batch_size - 1) / batch_size;
+            let order = if shuffle {
+                Tensor::randperm(count, (Kind::Int64, Device::Cpu))
+            } else {
+                Tensor::arange(count, (Kind::Int64, Device::Cpu))
+            };
+
+            Ok(self.register_loader(TorchDataLoader {
+                dataset: dataset_id,
+                batch_size,
+                order,
+                len,
+            }))
+        }
+    }
+
+    fn build_adam_optimizer(
+        &mut self,
+        parameters: Value,
+        learning_rate: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (parameters, learning_rate);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let model_id = match parameters {
+                Value::Host(HostValue::TorchModelParameters(id))
+                | Value::Host(HostValue::TorchModel(id)) => id,
+                _ => {
+                    return Err(RuntimeError::new(
+                        "`아담`의 첫 번째 인수는 모델의 `매개변수`여야 합니다.",
+                    ));
+                }
+            };
+            let learning_rate = expect_float("아담", learning_rate)?;
+            if learning_rate <= 0.0 {
+                return Err(RuntimeError::new("학습률은 0보다 커야 합니다."));
+            }
+
+            let model = self
+                .torch_models
+                .get(model_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+            let model_ref = model.borrow();
+            let optimizer = nn::Adam::default()
+                .build(&model_ref.var_store, learning_rate)
+                .map_err(|err| RuntimeError::new(format!("아담 최적화기 생성 실패: {err}")))?;
+            drop(model_ref);
+            Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+        }
+    }
+
+    fn zero_grad_optimizer(&mut self, optimizer: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = optimizer;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let optimizer_id = expect_optimizer_id(optimizer)?;
+            let optimizer = self
+                .torch_optimizers
+                .get(optimizer_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 최적화기입니다."))?;
+            optimizer.borrow_mut().optimizer.zero_grad();
+            Ok(Value::None)
+        }
+    }
+
+    fn forward_model(&mut self, model: Value, input: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (model, input);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let model_id = expect_model_id(model)?;
+            let input_tensor = expect_tensor("순전파", input, &self.torch_tensors)?;
+            let model = self
+                .torch_models
+                .get(model_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+            let model = model.borrow();
+            let logits = if model.is_training {
+                model.network.forward(&input_tensor)
+            } else {
+                no_grad(|| model.network.forward(&input_tensor))
+            };
+            drop(model);
+            Ok(self.register_tensor(logits))
+        }
+    }
+
+    fn compute_loss(
+        &mut self,
+        loss_fn: Value,
+        logits: Value,
+        labels: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (loss_fn, logits, labels);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let kind = match loss_fn {
+                Value::Host(HostValue::TorchLossFunction(kind)) => kind,
+                _ => {
+                    return Err(RuntimeError::new(
+                        "`손실계산`의 첫 번째 인수는 손실함수여야 합니다.",
+                    ));
+                }
+            };
+            let logits = expect_tensor("손실계산", logits, &self.torch_tensors)?;
+            let labels = expect_tensor("손실계산", labels, &self.torch_tensors)?;
+            let loss = match kind {
+                TorchLossKind::CrossEntropy => logits.cross_entropy_for_logits(&labels),
+            };
+            Ok(self.register_tensor(loss))
+        }
+    }
+
+    fn backward_tensor(&mut self, loss: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = loss;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let loss = expect_tensor("역전파", loss, &self.torch_tensors)?;
+            loss.backward();
+            Ok(Value::None)
+        }
+    }
+
+    fn step_optimizer(&mut self, optimizer: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = optimizer;
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let optimizer_id = expect_optimizer_id(optimizer)?;
+            let optimizer = self
+                .torch_optimizers
+                .get(optimizer_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 최적화기입니다."))?;
+            optimizer.borrow_mut().optimizer.step();
+            Ok(Value::None)
+        }
+    }
+
+    fn set_model_mode(&mut self, model: Value, is_training: bool) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (model, is_training);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let model_id = expect_model_id(model)?;
+            let model = self
+                .torch_models
+                .get(model_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+            model.borrow_mut().is_training = is_training;
+            Ok(Value::None)
+        }
+    }
+
+    fn fetch_batch(&mut self, loader: Value, batch_index: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (loader, batch_index);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let loader_id = expect_loader_id(loader)?;
+            let batch_index = expect_int("배치가져오기", batch_index)?;
+            if batch_index < 0 {
+                return Err(RuntimeError::new("배치 인덱스는 0 이상의 정수여야 합니다."));
+            }
+            let loader = self
+                .torch_loaders
+                .get(loader_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터로더입니다."))?;
+            if batch_index >= loader.len {
+                return Err(RuntimeError::new("배치 인덱스가 범위를 벗어났습니다."));
+            }
+            let dataset = self
+                .torch_datasets
+                .get(loader.dataset)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터셋입니다."))?;
+            let start = batch_index * loader.batch_size;
+            let total = dataset.labels.size().first().copied().unwrap_or(0);
+            let count = (total - start).min(loader.batch_size);
+            let batch_indices = loader.order.narrow(0, start, count);
+
+            let device = Device::cuda_if_available();
+            let images = dataset
+                .images
+                .index_select(0, &batch_indices)
+                .to_device(device)
+                .to_kind(Kind::Float);
+            let labels = dataset
+                .labels
+                .index_select(0, &batch_indices)
+                .to_device(device)
+                .to_kind(Kind::Int64);
+
+            Ok(self.register_batch(TorchBatch { images, labels }))
+        }
+    }
+
+    fn argmax_tensor(&mut self, tensor: Value, dim: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (tensor, dim);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tensor = expect_tensor("최대인덱스", tensor, &self.torch_tensors)?;
+            let dim = expect_int("최대인덱스", dim)?;
+            Ok(self.register_tensor(tensor.argmax(dim, false)))
+        }
+    }
+
+    fn count_equal(&mut self, left: Value, right: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (left, right);
+            Err(RuntimeError::new(
+                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let left = expect_tensor("같은값개수", left, &self.torch_tensors)?;
+            let right = expect_tensor("같은값개수", right, &self.torch_tensors)?;
+            let count = left.eq_tensor(&right).sum(Kind::Int64).int64_value(&[]);
+            Ok(Value::Int(count))
         }
     }
 
@@ -818,7 +1434,7 @@ impl Interpreter {
         }
     }
 
-    fn eval_property(&self, base: Value, name: &str) -> Result<Value, RuntimeError> {
+    fn eval_property(&mut self, base: Value, name: &str) -> Result<Value, RuntimeError> {
         match base {
             Value::Record(map) => {
                 if let Some(value) = map.borrow().get(name).cloned() {
@@ -833,6 +1449,74 @@ impl Interpreter {
                     "이 값에는 `{}` 속성이 없습니다.",
                     name
                 )))
+            }
+            Value::Host(HostValue::TorchBatch(batch_id)) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = (batch_id, name);
+                    Err(RuntimeError::new(
+                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+                    ))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let (images, labels) = {
+                        let batch = self
+                            .torch_batches
+                            .get(batch_id)
+                            .ok_or_else(|| RuntimeError::new("유효하지 않은 배치입니다."))?;
+                        (batch.images.shallow_clone(), batch.labels.shallow_clone())
+                    };
+                    match name {
+                        "이미지들" => Ok(self.register_tensor(images)),
+                        "라벨들" => Ok(self.register_tensor(labels)),
+                        _ => Err(RuntimeError::new(format!(
+                            "배치에는 `{}` 속성이 없습니다.",
+                            name
+                        ))),
+                    }
+                }
+            }
+            Value::Host(HostValue::TorchModel(model_id)) => match name {
+                "매개변수" => Ok(Value::Host(HostValue::TorchModelParameters(model_id))),
+                _ => Err(RuntimeError::new(format!(
+                    "모델에는 `{}` 속성이 없습니다.",
+                    name
+                ))),
+            },
+            Value::Host(HostValue::TorchTensor(tensor_id)) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = (tensor_id, name);
+                    Err(RuntimeError::new(
+                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+                    ))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let tensor = self
+                        .torch_tensors
+                        .get(tensor_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 텐서입니다."))?;
+                    match name {
+                        "길이" => {
+                            let size = tensor.size();
+                            Ok(Value::Int(size.first().copied().unwrap_or(0)))
+                        }
+                        "값" => {
+                            if tensor.numel() != 1 {
+                                return Err(RuntimeError::new(
+                                    "`값` 속성은 스칼라 텐서에서만 읽을 수 있습니다.",
+                                ));
+                            }
+                            Ok(Value::Float(tensor.double_value(&[])))
+                        }
+                        _ => Err(RuntimeError::new(format!(
+                            "텐서에는 `{}` 속성이 없습니다.",
+                            name
+                        ))),
+                    }
+                }
             }
             other => {
                 if let Some(selector) = unary_message_for_property(name) {
@@ -860,6 +1544,41 @@ impl Interpreter {
                 Ok(Value::Int(text.chars().count() as i64))
             }
             (Value::Record(map), UnaryMessage::Length) => Ok(Value::Int(map.borrow().len() as i64)),
+            (Value::Host(HostValue::TorchDataLoader(loader_id)), UnaryMessage::Length) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = loader_id;
+                    Err(RuntimeError::new(
+                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+                    ))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let loader = self
+                        .torch_loaders
+                        .get(loader_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터로더입니다."))?;
+                    Ok(Value::Int(loader.len))
+                }
+            }
+            (Value::Host(HostValue::TorchTensor(tensor_id)), UnaryMessage::Length) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = tensor_id;
+                    Err(RuntimeError::new(
+                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+                    ))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let tensor = self
+                        .torch_tensors
+                        .get(tensor_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 텐서입니다."))?;
+                    let size = tensor.size();
+                    Ok(Value::Int(size.first().copied().unwrap_or(0)))
+                }
+            }
             (Value::Int(value), UnaryMessage::Square) => Ok(Value::Int(value * value)),
             (Value::Float(value), UnaryMessage::Square) => Ok(Value::Float(value * value)),
             (Value::List(_), UnaryMessage::Square) => {
@@ -1034,6 +1753,42 @@ impl Interpreter {
         self.canvas_frames.push(frame.clone());
         self.events.push(ExecutionEvent::CanvasFrame { frame });
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_tensor(&mut self, tensor: Tensor) -> Value {
+        self.torch_tensors.push(tensor);
+        Value::Host(HostValue::TorchTensor(self.torch_tensors.len() - 1))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_dataset(&mut self, dataset: TorchDataset) -> Value {
+        self.torch_datasets.push(dataset);
+        Value::Host(HostValue::TorchDataset(self.torch_datasets.len() - 1))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_loader(&mut self, loader: TorchDataLoader) -> Value {
+        self.torch_loaders.push(loader);
+        Value::Host(HostValue::TorchDataLoader(self.torch_loaders.len() - 1))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_batch(&mut self, batch: TorchBatch) -> Value {
+        self.torch_batches.push(batch);
+        Value::Host(HostValue::TorchBatch(self.torch_batches.len() - 1))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_model(&mut self, model: TorchModel) -> Value {
+        self.torch_models.push(RefCell::new(model));
+        Value::Host(HostValue::TorchModel(self.torch_models.len() - 1))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_optimizer(&mut self, optimizer: TorchOptimizer) -> Value {
+        self.torch_optimizers.push(RefCell::new(optimizer));
+        Value::Host(HostValue::TorchOptimizer(self.torch_optimizers.len() - 1))
+    }
 }
 
 impl Environment {
@@ -1081,6 +1836,21 @@ impl Value {
             Value::Function(FunctionValue::Builtin(function)) => function.to_string(),
             Value::Function(FunctionValue::User(_)) => "<함수>".to_string(),
             Value::Host(HostValue::Canvas) => "<그림판>".to_string(),
+            Value::Host(HostValue::TorchLayer(TorchLayerKind::Flatten)) => {
+                "<레이어 평탄화>".to_string()
+            }
+            Value::Host(HostValue::TorchLayer(TorchLayerKind::Relu)) => "<레이어 렐루>".to_string(),
+            Value::Host(HostValue::TorchLayer(TorchLayerKind::Linear { .. })) => {
+                "<레이어 선형층>".to_string()
+            }
+            Value::Host(HostValue::TorchDataset(_)) => "<MNIST 데이터셋>".to_string(),
+            Value::Host(HostValue::TorchDataLoader(_)) => "<데이터로더>".to_string(),
+            Value::Host(HostValue::TorchBatch(_)) => "<배치>".to_string(),
+            Value::Host(HostValue::TorchModel(_)) => "<신경망 모델>".to_string(),
+            Value::Host(HostValue::TorchModelParameters(_)) => "<모델 매개변수>".to_string(),
+            Value::Host(HostValue::TorchLossFunction(_)) => "<손실함수>".to_string(),
+            Value::Host(HostValue::TorchOptimizer(_)) => "<최적화기>".to_string(),
+            Value::Host(HostValue::TorchTensor(_)) => "<텐서>".to_string(),
         }
     }
 }
@@ -1089,11 +1859,30 @@ impl fmt::Display for BuiltinFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BuiltinFunction::Length => write!(f, "<내장 함수 길이>"),
+            BuiltinFunction::CurrentTimeSeconds => write!(f, "<내장 함수 현재시간초>"),
             BuiltinFunction::Push => write!(f, "<내장 함수 추가>"),
             BuiltinFunction::PopLast => write!(f, "<내장 함수 마지막꺼내기>"),
             BuiltinFunction::ToString => write!(f, "<내장 함수 문자열로>"),
             BuiltinFunction::ToInt => write!(f, "<내장 함수 정수로>"),
             BuiltinFunction::ToFloat => write!(f, "<내장 함수 실수로>"),
+            BuiltinFunction::FlattenLayer => write!(f, "<내장 함수 평탄화>"),
+            BuiltinFunction::LinearLayer => write!(f, "<내장 함수 선형층>"),
+            BuiltinFunction::ReluLayer => write!(f, "<내장 함수 렐루>"),
+            BuiltinFunction::SequentialNetwork => write!(f, "<내장 함수 순차신경망>"),
+            BuiltinFunction::BuildMnistDataset => write!(f, "<내장 함수 숫자손글씨데이터셋>"),
+            BuiltinFunction::BuildDataLoader => write!(f, "<내장 함수 데이터로더>"),
+            BuiltinFunction::CrossEntropyLoss => write!(f, "<내장 함수 교차엔트로피손실>"),
+            BuiltinFunction::AdamOptimizer => write!(f, "<내장 함수 아담>"),
+            BuiltinFunction::ZeroGrad => write!(f, "<내장 함수 기울기초기화>"),
+            BuiltinFunction::Forward => write!(f, "<내장 함수 순전파>"),
+            BuiltinFunction::ComputeLoss => write!(f, "<내장 함수 손실계산>"),
+            BuiltinFunction::Backward => write!(f, "<내장 함수 역전파>"),
+            BuiltinFunction::OptimizerStep => write!(f, "<내장 함수 매개변수갱신>"),
+            BuiltinFunction::SetTrainMode => write!(f, "<내장 함수 학습모드로바꾸기>"),
+            BuiltinFunction::SetEvalMode => write!(f, "<내장 함수 평가모드로바꾸기>"),
+            BuiltinFunction::FetchBatch => write!(f, "<내장 함수 배치가져오기>"),
+            BuiltinFunction::ArgMax => write!(f, "<내장 함수 최대인덱스>"),
+            BuiltinFunction::CountEqual => write!(f, "<내장 함수 같은값개수>"),
         }
     }
 }
@@ -1102,11 +1891,30 @@ impl BuiltinFunction {
     fn name(self) -> &'static str {
         match self {
             BuiltinFunction::Length => "길이",
+            BuiltinFunction::CurrentTimeSeconds => "현재시간초",
             BuiltinFunction::Push => "추가",
             BuiltinFunction::PopLast => "마지막꺼내기",
             BuiltinFunction::ToString => "문자열로",
             BuiltinFunction::ToInt => "정수로",
             BuiltinFunction::ToFloat => "실수로",
+            BuiltinFunction::FlattenLayer => "평탄화",
+            BuiltinFunction::LinearLayer => "선형층",
+            BuiltinFunction::ReluLayer => "렐루",
+            BuiltinFunction::SequentialNetwork => "순차신경망",
+            BuiltinFunction::BuildMnistDataset => "숫자손글씨데이터셋",
+            BuiltinFunction::BuildDataLoader => "데이터로더",
+            BuiltinFunction::CrossEntropyLoss => "교차엔트로피손실",
+            BuiltinFunction::AdamOptimizer => "아담",
+            BuiltinFunction::ZeroGrad => "기울기초기화",
+            BuiltinFunction::Forward => "순전파",
+            BuiltinFunction::ComputeLoss => "손실계산",
+            BuiltinFunction::Backward => "역전파",
+            BuiltinFunction::OptimizerStep => "매개변수갱신",
+            BuiltinFunction::SetTrainMode => "학습모드로바꾸기",
+            BuiltinFunction::SetEvalMode => "평가모드로바꾸기",
+            BuiltinFunction::FetchBatch => "배치가져오기",
+            BuiltinFunction::ArgMax => "최대인덱스",
+            BuiltinFunction::CountEqual => "같은값개수",
         }
     }
 }
@@ -1116,6 +1924,10 @@ fn install_builtins(env: &EnvRef) {
     env.values.insert(
         "길이".into(),
         Value::Function(FunctionValue::Builtin(BuiltinFunction::Length)),
+    );
+    env.values.insert(
+        "현재시간초".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::CurrentTimeSeconds)),
     );
     env.values.insert(
         "추가".into(),
@@ -1136,6 +1948,93 @@ fn install_builtins(env: &EnvRef) {
     env.values.insert(
         "실수로".into(),
         Value::Function(FunctionValue::Builtin(BuiltinFunction::ToFloat)),
+    );
+    env.values.insert(
+        "평탄화".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::FlattenLayer)),
+    );
+    env.values.insert(
+        "선형층".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::LinearLayer)),
+    );
+    env.values.insert(
+        "렐루".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::ReluLayer)),
+    );
+    env.values.insert(
+        "순차신경망".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::SequentialNetwork)),
+    );
+    env.values.insert(
+        "숫자손글씨데이터셋".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::BuildMnistDataset)),
+    );
+    // Backward compatibility alias for older samples.
+    env.values.insert(
+        "숫자손글씨데이터셋만들기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::BuildMnistDataset)),
+    );
+    env.values.insert(
+        "데이터로더".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::BuildDataLoader)),
+    );
+    // Backward compatibility alias for older samples.
+    env.values.insert(
+        "데이터로더만들기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::BuildDataLoader)),
+    );
+    env.values.insert(
+        "교차엔트로피손실".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::CrossEntropyLoss)),
+    );
+    env.values.insert(
+        "아담".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::AdamOptimizer)),
+    );
+    env.values.insert(
+        "기울기초기화".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::ZeroGrad)),
+    );
+    env.values.insert(
+        "순전파".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::Forward)),
+    );
+    env.values.insert(
+        "손실계산".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::ComputeLoss)),
+    );
+    env.values.insert(
+        "역전파".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::Backward)),
+    );
+    env.values.insert(
+        "매개변수갱신".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::OptimizerStep)),
+    );
+    // Backward compatibility alias for previous naming.
+    env.values.insert(
+        "스텝".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::OptimizerStep)),
+    );
+    env.values.insert(
+        "학습모드로바꾸기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::SetTrainMode)),
+    );
+    env.values.insert(
+        "평가모드로바꾸기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::SetEvalMode)),
+    );
+    env.values.insert(
+        "배치가져오기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::FetchBatch)),
+    );
+    env.values.insert(
+        "최대인덱스".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::ArgMax)),
+    );
+    env.values.insert(
+        "같은값개수".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::CountEqual)),
     );
     env.values
         .insert("그림판".into(), Value::Host(HostValue::Canvas));
@@ -1175,6 +2074,100 @@ fn assign_value(env: &EnvRef, name: &str, value: Value) -> Result<(), RuntimeErr
         "`{}`를 바꿀 수 없습니다. 이 이름이 현재 스코프에 없습니다.",
         name
     )))
+}
+
+fn expect_int(name: &str, value: Value) -> Result<i64, RuntimeError> {
+    match value {
+        Value::Int(value) => Ok(value),
+        _ => Err(RuntimeError::new(format!(
+            "`{name}` 인수는 정수여야 합니다."
+        ))),
+    }
+}
+
+fn expect_float(name: &str, value: Value) -> Result<f64, RuntimeError> {
+    match value {
+        Value::Int(value) => Ok(value as f64),
+        Value::Float(value) => Ok(value),
+        _ => Err(RuntimeError::new(format!(
+            "`{name}` 인수는 숫자여야 합니다."
+        ))),
+    }
+}
+
+fn expect_model_id(value: Value) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Host(HostValue::TorchModel(id)) => Ok(id),
+        _ => Err(RuntimeError::new("이 값은 모델이어야 합니다.")),
+    }
+}
+
+fn expect_optimizer_id(value: Value) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Host(HostValue::TorchOptimizer(id)) => Ok(id),
+        _ => Err(RuntimeError::new("이 값은 최적화기여야 합니다.")),
+    }
+}
+
+fn expect_loader_id(value: Value) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Host(HostValue::TorchDataLoader(id)) => Ok(id),
+        _ => Err(RuntimeError::new("이 값은 데이터로더여야 합니다.")),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn expect_tensor(name: &str, value: Value, tensors: &[Tensor]) -> Result<Tensor, RuntimeError> {
+    match value {
+        Value::Host(HostValue::TorchTensor(id)) => tensors
+            .get(id)
+            .map(Tensor::shallow_clone)
+            .ok_or_else(|| RuntimeError::new(format!("`{name}` 인수의 텐서가 유효하지 않습니다."))),
+        _ => Err(RuntimeError::new(format!(
+            "`{name}` 인수는 텐서여야 합니다."
+        ))),
+    }
+}
+
+fn expect_list_values(name: &str, value: Value) -> Result<Vec<Value>, RuntimeError> {
+    match value {
+        Value::List(items) => Ok(items.borrow().clone()),
+        _ => Err(RuntimeError::new(format!(
+            "`{name}` 인수는 목록이어야 합니다."
+        ))),
+    }
+}
+
+fn expect_bool_field(record: &BTreeMap<String, Value>, key: &str) -> Result<bool, RuntimeError> {
+    match record.get(key) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(RuntimeError::new(format!(
+            "`{key}` 필드는 불리언이어야 합니다."
+        ))),
+        None => Err(RuntimeError::new(format!("`{key}` 필드가 필요합니다."))),
+    }
+}
+
+fn expect_int_field(record: &BTreeMap<String, Value>, key: &str) -> Result<i64, RuntimeError> {
+    match record.get(key) {
+        Some(Value::Int(value)) => Ok(*value),
+        Some(_) => Err(RuntimeError::new(format!(
+            "`{key}` 필드는 정수여야 합니다."
+        ))),
+        None => Err(RuntimeError::new(format!("`{key}` 필드가 필요합니다."))),
+    }
+}
+
+fn expect_host_id_field(
+    record: &BTreeMap<String, Value>,
+    key: &str,
+    extract: impl Fn(&Value) -> Option<usize>,
+) -> Result<usize, RuntimeError> {
+    match record.get(key) {
+        Some(value) => extract(value)
+            .ok_or_else(|| RuntimeError::new(format!("`{key}` 필드 타입이 올바르지 않습니다."))),
+        None => Err(RuntimeError::new(format!("`{key}` 필드가 필요합니다."))),
+    }
 }
 
 fn numeric_binary(

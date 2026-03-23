@@ -363,6 +363,14 @@ impl<'a> Lexer<'a> {
         }
 
         if let Some((base, suffix_kind, suffix)) = split_attached_word(&word) {
+            if matches!(suffix_kind, TokenKind::Subject) && peek_char(chars, end) == Some('(') {
+                self.tokens.push(Token::new(
+                    TokenKind::Ident,
+                    word,
+                    Span::new(line_no, start + 1, line_no, end + 1),
+                ));
+                return Ok(end);
+            }
             let base_len = base.chars().count();
             let base_kind = exact_word_kind(&base).unwrap_or(TokenKind::Ident);
             self.tokens.push(Token::new(

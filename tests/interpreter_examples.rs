@@ -47,6 +47,14 @@ fn records_sleep_event_from_statement() {
 }
 
 #[test]
+fn runs_current_time_seconds_builtin() {
+    let source = r#"시작은 현재시간초()이다
+끝은 현재시간초()이다
+끝 >= 시작을 출력한다"#;
+    assert_output(source, &["참"]);
+}
+
+#[test]
 fn runs_if_else_example() {
     let source = r#"나이는 20이다
 나이 >= 20이면
