@@ -220,7 +220,9 @@ struct Interpreter {
     #[cfg(not(target_arch = "wasm32"))]
     run_started_at: Instant,
     #[cfg(not(target_arch = "wasm32"))]
-    torch_device: Device,
+    torch_device: Option<Device>,
+    #[cfg(not(target_arch = "wasm32"))]
+    mnist_cache: Option<tch::vision::dataset::Dataset>,
     #[cfg(not(target_arch = "wasm32"))]
     torch_datasets: Vec<TorchDataset>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -322,7 +324,9 @@ impl Interpreter {
             #[cfg(not(target_arch = "wasm32"))]
             run_started_at: Instant::now(),
             #[cfg(not(target_arch = "wasm32"))]
-            torch_device: select_torch_device(),
+            torch_device: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            mnist_cache: None,
             #[cfg(not(target_arch = "wasm32"))]
             torch_datasets: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -332,6 +336,11 @@ impl Interpreter {
             #[cfg(not(target_arch = "wasm32"))]
             torch_optimizers: Vec::new(),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn torch_device(&mut self) -> Device {
+        *self.torch_device.get_or_insert_with(select_torch_device)
     }
 
     fn run_program(&mut self, program: &Program) -> Result<ExecutionResult, RuntimeError> {
@@ -985,7 +994,7 @@ impl Interpreter {
                 }
             }
 
-            let device = self.torch_device;
+            let device = self.torch_device();
             let var_store = nn::VarStore::new(device);
             let path = var_store.root();
             let mut network = nn::seq();
@@ -1030,14 +1039,18 @@ impl Interpreter {
         {
             let record = expect_record("숫자손글씨데이터셋", config)?;
             let is_train = expect_bool_field(&record, "학습용")?;
-            let mnist = load_mnist_bundle()?;
-
-            let (images, labels) = if is_train {
-                (mnist.train_images, mnist.train_labels)
-            } else {
-                (mnist.test_images, mnist.test_labels)
+            let device = self.torch_device();
+            if self.mnist_cache.is_none() {
+                self.mnist_cache = Some(load_mnist_bundle()?);
+            }
+            let (images, labels) = {
+                let mnist = self.mnist_cache.as_ref().unwrap();
+                if is_train {
+                    (mnist.train_images.shallow_clone(), mnist.train_labels.shallow_clone())
+                } else {
+                    (mnist.test_images.shallow_clone(), mnist.test_labels.shallow_clone())
+                }
             };
-            let device = self.torch_device;
             Ok(self.register_dataset(TorchDataset {
                 images: images.to_device(device).to_kind(Kind::Float),
                 labels: labels.to_device(device).to_kind(Kind::Int64),
@@ -1063,13 +1076,13 @@ impl Interpreter {
                 return Err(RuntimeError::new("`배치크기`는 1 이상의 정수여야 합니다."));
             }
             let shuffle = expect_bool_field(&record, "섞기여부")?;
+            let device = self.torch_device();
             let dataset = self
                 .torch_datasets
                 .get(dataset_id)
                 .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터셋입니다."))?;
             let count = dataset.labels.size().first().copied().unwrap_or(0);
             let len = (count + batch_size - 1) / batch_size;
-            let device = self.torch_device;
             let order = if shuffle {
                 Tensor::randperm(count, (Kind::Int64, device))
             } else {
@@ -1152,18 +1165,17 @@ impl Interpreter {
         {
             let model_id = expect_model_id(model)?;
             let input_tensor = expect_tensor("순전파", input)?;
-            let model = self
+            let model_cell = self
                 .torch_models
                 .get(model_id)
                 .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
-            let model = model.borrow();
+            let model = model_cell.borrow();
             let logits = if model.is_training {
                 model.network.forward(&input_tensor)
             } else {
                 no_grad(|| model.network.forward(&input_tensor))
             };
-            drop(model);
-            Ok(self.register_tensor(logits))
+            Ok(Self::wrap_tensor(logits))
         }
     }
 
@@ -1193,7 +1205,7 @@ impl Interpreter {
             let loss = match kind {
                 TorchLossKind::CrossEntropy => logits.cross_entropy_for_logits(&labels),
             };
-            Ok(self.register_tensor(loss))
+            Ok(Self::wrap_tensor(loss))
         }
     }
 
@@ -1279,7 +1291,7 @@ impl Interpreter {
             let images = dataset.images.index_select(0, &batch_indices);
             let labels = dataset.labels.index_select(0, &batch_indices);
 
-            Ok(self.register_batch(TorchBatch { images, labels }))
+            Ok(Self::wrap_batch(TorchBatch { images, labels }))
         }
     }
 
@@ -1293,7 +1305,7 @@ impl Interpreter {
         {
             let tensor = expect_tensor("최대인덱스", tensor)?;
             let dim = expect_int("최대인덱스", dim)?;
-            Ok(self.register_tensor(tensor.argmax(dim, false)))
+            Ok(Self::wrap_tensor(tensor.argmax(dim, false)))
         }
     }
 
@@ -1430,8 +1442,8 @@ impl Interpreter {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Value::Batch(batch) => match name {
-                "이미지들" => Ok(self.register_tensor(batch.images.shallow_clone())),
-                "라벨들" => Ok(self.register_tensor(batch.labels.shallow_clone())),
+                "이미지들" => Ok(Self::wrap_tensor(batch.images.shallow_clone())),
+                "라벨들" => Ok(Self::wrap_tensor(batch.labels.shallow_clone())),
                 _ => Err(RuntimeError::new(format!(
                     "배치에는 `{}` 속성이 없습니다.",
                     name
@@ -1690,7 +1702,7 @@ impl Interpreter {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn register_tensor(&mut self, tensor: Tensor) -> Value {
+    fn wrap_tensor(tensor: Tensor) -> Value {
         Value::Tensor(Rc::new(tensor))
     }
 
@@ -1707,7 +1719,7 @@ impl Interpreter {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn register_batch(&mut self, batch: TorchBatch) -> Value {
+    fn wrap_batch(batch: TorchBatch) -> Value {
         Value::Batch(Rc::new(batch))
     }
 
@@ -2059,9 +2071,9 @@ fn expect_loader_id(value: Value) -> Result<usize, RuntimeError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn expect_tensor(name: &str, value: Value) -> Result<Tensor, RuntimeError> {
+fn expect_tensor(name: &str, value: Value) -> Result<Rc<Tensor>, RuntimeError> {
     match value {
-        Value::Tensor(tensor) => Ok(tensor.as_ref().shallow_clone()),
+        Value::Tensor(tensor) => Ok(tensor),
         _ => Err(RuntimeError::new(format!(
             "`{name}` 인수는 텐서여야 합니다."
         ))),
@@ -2243,8 +2255,9 @@ fn expect_sleep_seconds(value: Value) -> Result<f64, RuntimeError> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn select_torch_device() -> Device {
-    // `cuda_if_available`가 false를 돌려도 드라이버/런타임이 준비된 환경에서는
-    // 실제 텐서 할당이 성공하는 경우가 있어, 실할당으로 한 번 더 확인한다.
+    if !tch::Cuda::is_available() {
+        return Device::Cpu;
+    }
     let cuda = Device::Cuda(0);
     if Tensor::f_zeros([1i64], (Kind::Float, cuda)).is_ok() {
         cuda
