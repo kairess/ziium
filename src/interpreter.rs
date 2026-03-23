@@ -12,8 +12,14 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
+use std::io::{self, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
@@ -47,6 +53,10 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Record(Rc<RefCell<BTreeMap<String, Value>>>),
     Function(FunctionValue),
+    #[cfg(not(target_arch = "wasm32"))]
+    Tensor(Rc<Tensor>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Batch(Rc<TorchBatch>),
     Host(HostValue),
 }
 
@@ -99,12 +109,10 @@ pub enum HostValue {
     TorchLayer(TorchLayerKind),
     TorchDataset(usize),
     TorchDataLoader(usize),
-    TorchBatch(usize),
     TorchModel(usize),
     TorchModelParameters(usize),
     TorchLossFunction(TorchLossKind),
     TorchOptimizer(usize),
-    TorchTensor(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +145,7 @@ struct TorchDataLoader {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
-struct TorchBatch {
+pub struct TorchBatch {
     images: Tensor,
     labels: Tensor,
 }
@@ -204,20 +212,19 @@ struct Interpreter {
     current_canvas_commands: Vec<CanvasCommand>,
     canvas_frames: Vec<CanvasFrame>,
     events: Vec<ExecutionEvent>,
+    stream_events: bool,
     #[cfg(not(target_arch = "wasm32"))]
     run_started_at: Instant,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_device: Device,
     #[cfg(not(target_arch = "wasm32"))]
     torch_datasets: Vec<TorchDataset>,
     #[cfg(not(target_arch = "wasm32"))]
     torch_loaders: Vec<TorchDataLoader>,
     #[cfg(not(target_arch = "wasm32"))]
-    torch_batches: Vec<TorchBatch>,
-    #[cfg(not(target_arch = "wasm32"))]
     torch_models: Vec<RefCell<TorchModel>>,
     #[cfg(not(target_arch = "wasm32"))]
     torch_optimizers: Vec<RefCell<TorchOptimizer>>,
-    #[cfg(not(target_arch = "wasm32"))]
-    torch_tensors: Vec<Tensor>,
 }
 
 #[derive(Debug)]
@@ -284,6 +291,10 @@ impl InterpreterSession {
             .run_program(&hir_program)
             .map_err(RunError::from)
     }
+
+    pub fn set_stream_events(&mut self, enabled: bool) {
+        self.interpreter.set_stream_events(enabled);
+    }
 }
 
 impl Default for InterpreterSession {
@@ -303,20 +314,19 @@ impl Interpreter {
             current_canvas_commands: Vec::new(),
             canvas_frames: Vec::new(),
             events: Vec::new(),
+            stream_events: false,
             #[cfg(not(target_arch = "wasm32"))]
             run_started_at: Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_device: select_torch_device(),
             #[cfg(not(target_arch = "wasm32"))]
             torch_datasets: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             torch_loaders: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
-            torch_batches: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             torch_models: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             torch_optimizers: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            torch_tensors: Vec::new(),
         }
     }
 
@@ -342,6 +352,10 @@ impl Interpreter {
                 "`돌려준다`는 함수 본문 안에서만 사용할 수 있습니다.",
             )),
         }
+    }
+
+    fn set_stream_events(&mut self, enabled: bool) {
+        self.stream_events = enabled;
     }
 
     fn execute_block(
@@ -387,6 +401,18 @@ impl Interpreter {
                     .eval_expr(value, env)
                     .map_err(|err| err.with_fallback_span(stmt_span))?;
                 let rendered = value.render();
+                if self.stream_events {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let mut stdout = io::stdout().lock();
+                        writeln!(stdout, "{rendered}").map_err(|err| {
+                            RuntimeError::new(format!("출력을 쓰지 못했습니다: {err}"))
+                        })?;
+                        stdout.flush().map_err(|err| {
+                            RuntimeError::new(format!("출력을 비우지 못했습니다: {err}"))
+                        })?;
+                    }
+                }
                 self.output.push(rendered.clone());
                 self.events.push(ExecutionEvent::Output { text: rendered });
                 Ok(ExecSignal::Continue)
@@ -401,6 +427,12 @@ impl Interpreter {
                     .map_err(|err| err.with_fallback_span(stmt_span))?;
                 self.finish_canvas_frame();
                 self.events.push(ExecutionEvent::Sleep { seconds });
+                if self.stream_events {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        thread::sleep(Duration::from_secs_f64(seconds));
+                    }
+                }
                 Ok(ExecSignal::Continue)
             }
             Stmt::Return { value, .. } => {
@@ -932,9 +964,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = layers;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -951,7 +981,7 @@ impl Interpreter {
                 }
             }
 
-            let device = Device::cuda_if_available();
+            let device = self.torch_device;
             let var_store = nn::VarStore::new(device);
             let path = var_store.root();
             let mut network = nn::seq();
@@ -990,50 +1020,24 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = config;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let record = expect_record("숫자손글씨데이터셋", config)?;
             let is_train = expect_bool_field(&record, "학습용")?;
-            let candidate_dirs = ["data", "data/MNIST/raw"];
-            let mut mnist = None;
-            let mut last_error = None;
-            for dir in candidate_dirs {
-                if !Path::new(dir).exists() {
-                    continue;
-                }
-                match tch::vision::mnist::load_dir(dir) {
-                    Ok(loaded) => {
-                        mnist = Some(loaded);
-                        break;
-                    }
-                    Err(err) => {
-                        last_error = Some((dir.to_string(), err.to_string()));
-                    }
-                }
-            }
-            let mnist = mnist.ok_or_else(|| {
-                if let Some((dir, err)) = last_error {
-                    RuntimeError::new(format!(
-                        "MNIST 데이터를 불러오지 못했습니다. 시도 경로: `data`, `data/MNIST/raw` (마지막 실패: `{dir}` - {err})"
-                    ))
-                } else {
-                    RuntimeError::new(
-                        "MNIST 데이터를 불러오지 못했습니다. `data` 또는 `data/MNIST/raw` 경로를 확인하세요."
-                            .to_string(),
-                    )
-                }
-            })?;
+            let mnist = load_mnist_bundle()?;
 
             let (images, labels) = if is_train {
                 (mnist.train_images, mnist.train_labels)
             } else {
                 (mnist.test_images, mnist.test_labels)
             };
-            Ok(self.register_dataset(TorchDataset { images, labels }))
+            let device = self.torch_device;
+            Ok(self.register_dataset(TorchDataset {
+                images: images.to_device(device).to_kind(Kind::Float),
+                labels: labels.to_device(device).to_kind(Kind::Int64),
+            }))
         }
     }
 
@@ -1041,9 +1045,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = config;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1063,10 +1065,11 @@ impl Interpreter {
                 .ok_or_else(|| RuntimeError::new("유효하지 않은 데이터셋입니다."))?;
             let count = dataset.labels.size().first().copied().unwrap_or(0);
             let len = (count + batch_size - 1) / batch_size;
+            let device = self.torch_device;
             let order = if shuffle {
-                Tensor::randperm(count, (Kind::Int64, Device::Cpu))
+                Tensor::randperm(count, (Kind::Int64, device))
             } else {
-                Tensor::arange(count, (Kind::Int64, Device::Cpu))
+                Tensor::arange(count, (Kind::Int64, device))
             };
 
             Ok(self.register_loader(TorchDataLoader {
@@ -1086,9 +1089,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (parameters, learning_rate);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1123,9 +1124,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = optimizer;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1143,14 +1142,12 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (model, input);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let model_id = expect_model_id(model)?;
-            let input_tensor = expect_tensor("순전파", input, &self.torch_tensors)?;
+            let input_tensor = expect_tensor("순전파", input)?;
             let model = self
                 .torch_models
                 .get(model_id)
@@ -1175,9 +1172,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (loss_fn, logits, labels);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1189,8 +1184,8 @@ impl Interpreter {
                     ));
                 }
             };
-            let logits = expect_tensor("손실계산", logits, &self.torch_tensors)?;
-            let labels = expect_tensor("손실계산", labels, &self.torch_tensors)?;
+            let logits = expect_tensor("손실계산", logits)?;
+            let labels = expect_tensor("손실계산", labels)?;
             let loss = match kind {
                 TorchLossKind::CrossEntropy => logits.cross_entropy_for_logits(&labels),
             };
@@ -1202,13 +1197,11 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = loss;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let loss = expect_tensor("역전파", loss, &self.torch_tensors)?;
+            let loss = expect_tensor("역전파", loss)?;
             loss.backward();
             Ok(Value::None)
         }
@@ -1218,9 +1211,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = optimizer;
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1238,9 +1229,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (model, is_training);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1258,9 +1247,7 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (loader, batch_index);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1285,17 +1272,8 @@ impl Interpreter {
             let count = (total - start).min(loader.batch_size);
             let batch_indices = loader.order.narrow(0, start, count);
 
-            let device = Device::cuda_if_available();
-            let images = dataset
-                .images
-                .index_select(0, &batch_indices)
-                .to_device(device)
-                .to_kind(Kind::Float);
-            let labels = dataset
-                .labels
-                .index_select(0, &batch_indices)
-                .to_device(device)
-                .to_kind(Kind::Int64);
+            let images = dataset.images.index_select(0, &batch_indices);
+            let labels = dataset.labels.index_select(0, &batch_indices);
 
             Ok(self.register_batch(TorchBatch { images, labels }))
         }
@@ -1305,13 +1283,11 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (tensor, dim);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let tensor = expect_tensor("최대인덱스", tensor, &self.torch_tensors)?;
+            let tensor = expect_tensor("최대인덱스", tensor)?;
             let dim = expect_int("최대인덱스", dim)?;
             Ok(self.register_tensor(tensor.argmax(dim, false)))
         }
@@ -1321,14 +1297,12 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (left, right);
-            Err(RuntimeError::new(
-                "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-            ))
+            self.pytorch_unavailable()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let left = expect_tensor("같은값개수", left, &self.torch_tensors)?;
-            let right = expect_tensor("같은값개수", right, &self.torch_tensors)?;
+            let left = expect_tensor("같은값개수", left)?;
+            let right = expect_tensor("같은값개수", right)?;
             let count = left.eq_tensor(&right).sum(Kind::Int64).int64_value(&[]);
             Ok(Value::Int(count))
         }
@@ -1450,33 +1424,15 @@ impl Interpreter {
                     name
                 )))
             }
-            Value::Host(HostValue::TorchBatch(batch_id)) => {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = (batch_id, name);
-                    Err(RuntimeError::new(
-                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-                    ))
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let (images, labels) = {
-                        let batch = self
-                            .torch_batches
-                            .get(batch_id)
-                            .ok_or_else(|| RuntimeError::new("유효하지 않은 배치입니다."))?;
-                        (batch.images.shallow_clone(), batch.labels.shallow_clone())
-                    };
-                    match name {
-                        "이미지들" => Ok(self.register_tensor(images)),
-                        "라벨들" => Ok(self.register_tensor(labels)),
-                        _ => Err(RuntimeError::new(format!(
-                            "배치에는 `{}` 속성이 없습니다.",
-                            name
-                        ))),
-                    }
-                }
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Batch(batch) => match name {
+                "이미지들" => Ok(self.register_tensor(batch.images.shallow_clone())),
+                "라벨들" => Ok(self.register_tensor(batch.labels.shallow_clone())),
+                _ => Err(RuntimeError::new(format!(
+                    "배치에는 `{}` 속성이 없습니다.",
+                    name
+                ))),
+            },
             Value::Host(HostValue::TorchModel(model_id)) => match name {
                 "매개변수" => Ok(Value::Host(HostValue::TorchModelParameters(model_id))),
                 _ => Err(RuntimeError::new(format!(
@@ -1484,38 +1440,26 @@ impl Interpreter {
                     name
                 ))),
             },
-            Value::Host(HostValue::TorchTensor(tensor_id)) => {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = (tensor_id, name);
-                    Err(RuntimeError::new(
-                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-                    ))
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let tensor = self
-                        .torch_tensors
-                        .get(tensor_id)
-                        .ok_or_else(|| RuntimeError::new("유효하지 않은 텐서입니다."))?;
-                    match name {
-                        "길이" => {
-                            let size = tensor.size();
-                            Ok(Value::Int(size.first().copied().unwrap_or(0)))
-                        }
-                        "값" => {
-                            if tensor.numel() != 1 {
-                                return Err(RuntimeError::new(
-                                    "`값` 속성은 스칼라 텐서에서만 읽을 수 있습니다.",
-                                ));
-                            }
-                            Ok(Value::Float(tensor.double_value(&[])))
-                        }
-                        _ => Err(RuntimeError::new(format!(
-                            "텐서에는 `{}` 속성이 없습니다.",
-                            name
-                        ))),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Tensor(tensor) => {
+                let tensor = tensor.as_ref();
+                match name {
+                    "길이" => {
+                        let size = tensor.size();
+                        Ok(Value::Int(size.first().copied().unwrap_or(0)))
                     }
+                    "값" => {
+                        if tensor.numel() != 1 {
+                            return Err(RuntimeError::new(
+                                "`값` 속성은 스칼라 텐서에서만 읽을 수 있습니다.",
+                            ));
+                        }
+                        Ok(Value::Float(tensor.double_value(&[])))
+                    }
+                    _ => Err(RuntimeError::new(format!(
+                        "텐서에는 `{}` 속성이 없습니다.",
+                        name
+                    ))),
                 }
             }
             other => {
@@ -1561,23 +1505,10 @@ impl Interpreter {
                     Ok(Value::Int(loader.len))
                 }
             }
-            (Value::Host(HostValue::TorchTensor(tensor_id)), UnaryMessage::Length) => {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = tensor_id;
-                    Err(RuntimeError::new(
-                        "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
-                    ))
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let tensor = self
-                        .torch_tensors
-                        .get(tensor_id)
-                        .ok_or_else(|| RuntimeError::new("유효하지 않은 텐서입니다."))?;
-                    let size = tensor.size();
-                    Ok(Value::Int(size.first().copied().unwrap_or(0)))
-                }
+            #[cfg(not(target_arch = "wasm32"))]
+            (Value::Tensor(tensor), UnaryMessage::Length) => {
+                let size = tensor.size();
+                Ok(Value::Int(size.first().copied().unwrap_or(0)))
             }
             (Value::Int(value), UnaryMessage::Square) => Ok(Value::Int(value * value)),
             (Value::Float(value), UnaryMessage::Square) => Ok(Value::Float(value * value)),
@@ -1756,8 +1687,7 @@ impl Interpreter {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn register_tensor(&mut self, tensor: Tensor) -> Value {
-        self.torch_tensors.push(tensor);
-        Value::Host(HostValue::TorchTensor(self.torch_tensors.len() - 1))
+        Value::Tensor(Rc::new(tensor))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1774,8 +1704,7 @@ impl Interpreter {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn register_batch(&mut self, batch: TorchBatch) -> Value {
-        self.torch_batches.push(batch);
-        Value::Host(HostValue::TorchBatch(self.torch_batches.len() - 1))
+        Value::Batch(Rc::new(batch))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1788,6 +1717,13 @@ impl Interpreter {
     fn register_optimizer(&mut self, optimizer: TorchOptimizer) -> Value {
         self.torch_optimizers.push(RefCell::new(optimizer));
         Value::Host(HostValue::TorchOptimizer(self.torch_optimizers.len() - 1))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn pytorch_unavailable<T>(&self) -> Result<T, RuntimeError> {
+        Err(RuntimeError::new(
+            "현재 환경에서는 PyTorch 래퍼를 사용할 수 없습니다.",
+        ))
     }
 }
 
@@ -1845,12 +1781,14 @@ impl Value {
             }
             Value::Host(HostValue::TorchDataset(_)) => "<MNIST 데이터셋>".to_string(),
             Value::Host(HostValue::TorchDataLoader(_)) => "<데이터로더>".to_string(),
-            Value::Host(HostValue::TorchBatch(_)) => "<배치>".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Batch(_) => "<배치>".to_string(),
             Value::Host(HostValue::TorchModel(_)) => "<신경망 모델>".to_string(),
             Value::Host(HostValue::TorchModelParameters(_)) => "<모델 매개변수>".to_string(),
             Value::Host(HostValue::TorchLossFunction(_)) => "<손실함수>".to_string(),
             Value::Host(HostValue::TorchOptimizer(_)) => "<최적화기>".to_string(),
-            Value::Host(HostValue::TorchTensor(_)) => "<텐서>".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Tensor(_) => "<텐서>".to_string(),
         }
     }
 }
@@ -2117,12 +2055,9 @@ fn expect_loader_id(value: Value) -> Result<usize, RuntimeError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn expect_tensor(name: &str, value: Value, tensors: &[Tensor]) -> Result<Tensor, RuntimeError> {
+fn expect_tensor(name: &str, value: Value) -> Result<Tensor, RuntimeError> {
     match value {
-        Value::Host(HostValue::TorchTensor(id)) => tensors
-            .get(id)
-            .map(Tensor::shallow_clone)
-            .ok_or_else(|| RuntimeError::new(format!("`{name}` 인수의 텐서가 유효하지 않습니다."))),
+        Value::Tensor(tensor) => Ok(tensor.as_ref().shallow_clone()),
         _ => Err(RuntimeError::new(format!(
             "`{name}` 인수는 텐서여야 합니다."
         ))),
@@ -2212,6 +2147,10 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::None, Value::None) => true,
+        #[cfg(not(target_arch = "wasm32"))]
+        (Value::Tensor(a), Value::Tensor(b)) => Rc::ptr_eq(a, b),
+        #[cfg(not(target_arch = "wasm32"))]
+        (Value::Batch(a), Value::Batch(b)) => Rc::ptr_eq(a, b),
         (Value::Host(a), Value::Host(b)) => a == b,
         (Value::List(a), Value::List(b)) => {
             let a = a.borrow();
@@ -2295,6 +2234,43 @@ fn expect_sleep_seconds(value: Value) -> Result<f64, RuntimeError> {
             Err(RuntimeError::new("`쉬기` 시간은 0 이상의 값이어야 합니다."))
         }
         _ => Err(RuntimeError::new("`쉬기` 시간은 숫자여야 합니다.")),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn select_torch_device() -> Device {
+    // `cuda_if_available`가 false를 돌려도 드라이버/런타임이 준비된 환경에서는
+    // 실제 텐서 할당이 성공하는 경우가 있어, 실할당으로 한 번 더 확인한다.
+    let cuda = Device::Cuda(0);
+    if Tensor::f_zeros([1i64], (Kind::Float, cuda)).is_ok() {
+        cuda
+    } else {
+        Device::Cpu
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_mnist_bundle() -> Result<tch::vision::dataset::Dataset, RuntimeError> {
+    const CANDIDATE_DIRS: [&str; 2] = ["data", "data/MNIST/raw"];
+
+    let mut last_error = None;
+    for dir in CANDIDATE_DIRS {
+        if !Path::new(dir).exists() {
+            continue;
+        }
+        match tch::vision::mnist::load_dir(dir) {
+            Ok(dataset) => return Ok(dataset),
+            Err(err) => last_error = Some((dir, err)),
+        }
+    }
+
+    match last_error {
+        Some((dir, err)) => Err(RuntimeError::new(format!(
+            "MNIST 데이터를 불러오지 못했습니다. 시도 경로: `data`, `data/MNIST/raw` (마지막 실패: `{dir}` - {err})"
+        ))),
+        None => Err(RuntimeError::new(
+            "MNIST 데이터를 불러오지 못했습니다. `data` 또는 `data/MNIST/raw` 경로를 확인하세요.",
+        )),
     }
 }
 

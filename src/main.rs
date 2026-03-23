@@ -3,22 +3,79 @@ use rustyline::error::ReadlineError;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::Path;
+use std::process::Command;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 use ziium::{
     FrontendError, InterpreterSession, LexError, ParseError, ResolveError, RunError, RuntimeError,
-    Span, Token, TokenKind, lex, parse_source, parse_source_to_hir, run_source,
+    Span, Token, TokenKind, lex, parse_source, parse_source_to_hir,
 };
 
 fn main() -> ExitCode {
+    configure_torch_runtime_env();
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn configure_torch_runtime_env() {
+    if env::var_os("LIBTORCH_USE_PYTORCH").is_none() {
+        // SAFETY: 실행 시작 직후 단일 스레드 구간에서만 환경 변수를 설정한다.
+        unsafe {
+            env::set_var("LIBTORCH_USE_PYTORCH", "1");
+        }
+    }
+
+    let python = if Path::new(".venv/bin/python").exists() {
+        ".venv/bin/python"
+    } else {
+        "python"
+    };
+
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(
+            "import pathlib, torch\n\
+root = pathlib.Path(torch.__file__).resolve().parent\n\
+paths = [root / 'lib']\n\
+nvidia = root.parent / 'nvidia'\n\
+if nvidia.exists():\n\
+    for d in sorted(nvidia.glob('*/lib')):\n\
+        paths.append(d)\n\
+print(':'.join(str(p) for p in paths if p.exists()))",
+        )
+        .output();
+
+    let Ok(output) = output else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(discovered) = String::from_utf8(output.stdout) else {
+        return;
+    };
+    let discovered = discovered.trim();
+    if discovered.is_empty() {
+        return;
+    }
+
+    let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let merged = if existing.is_empty() {
+        discovered.to_string()
+    } else {
+        format!("{discovered}:{existing}")
+    };
+    // SAFETY: 실행 시작 직후 단일 스레드 구간에서만 환경 변수를 설정한다.
+    unsafe {
+        env::set_var("LD_LIBRARY_PATH", merged);
     }
 }
 
@@ -49,8 +106,11 @@ fn run_cli() -> Result<(), String> {
         }
         "run" => {
             let source = read_source(path.as_deref()).map_err(render_input_error)?;
-            let result = run_source(&source).map_err(|err| render_run_diagnostic(err, &source))?;
-            print_output(result)?;
+            let mut session = InterpreterSession::new();
+            session.set_stream_events(true);
+            let _ = session
+                .run_source(&source)
+                .map_err(|err| render_run_diagnostic(err, &source))?;
         }
         "tokens" => {
             let source = read_source(path.as_deref()).map_err(render_input_error)?;
