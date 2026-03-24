@@ -28,7 +28,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
-use tch::nn::{self, Module, OptimizerConfig};
+use tch::nn::{self, Module, ModuleT, OptimizerConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use tch::vision::{imagenet, resnet, densenet, vgg, squeezenet, alexnet, inception, mobilenet};
 #[cfg(not(target_arch = "wasm32"))]
 use tch::{Device, Kind, Tensor, no_grad};
 
@@ -105,6 +107,11 @@ pub enum BuiltinFunction {
     FetchBatch,
     ArgMax,
     CountEqual,
+    Conv2dLayer,
+    LoadPretrainedModel,
+    LoadImage,
+    ClassifyImage,
+    BuildFineTuneModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +124,9 @@ pub enum HostValue {
     TorchModelParameters(usize),
     TorchLossFunction(TorchLossKind),
     TorchOptimizer(usize),
+    TorchPretrainedModel(usize),
+    TorchPretrainedModelParameters(usize),
+    TorchFineTuneModel(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +134,7 @@ pub enum TorchLayerKind {
     Flatten,
     Relu,
     Linear { in_features: i64, out_features: i64 },
+    Conv2d { in_channels: i64, out_channels: i64, kernel_size: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +177,31 @@ struct TorchModel {
 #[derive(Debug)]
 struct TorchOptimizer {
     optimizer: nn::Optimizer,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PretrainedNet(Box<dyn ModuleT>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for PretrainedNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<사전학습 네트워크>")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchPretrainedModel {
+    var_store: nn::VarStore,
+    network: PretrainedNet,
+    is_training: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct TorchFineTuneModel {
+    backbone_id: usize,
+    head_id: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -231,6 +267,10 @@ struct Interpreter {
     torch_models: Vec<RefCell<TorchModel>>,
     #[cfg(not(target_arch = "wasm32"))]
     torch_optimizers: Vec<RefCell<TorchOptimizer>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_pretrained_models: Vec<TorchPretrainedModel>,
+    #[cfg(not(target_arch = "wasm32"))]
+    torch_finetune_models: Vec<TorchFineTuneModel>,
 }
 
 #[derive(Debug)]
@@ -335,6 +375,10 @@ impl Interpreter {
             torch_models: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             torch_optimizers: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_pretrained_models: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            torch_finetune_models: Vec::new(),
         }
     }
 
@@ -908,6 +952,17 @@ impl Interpreter {
                 let [] = expect_arity::<0>("렐루", args)?;
                 Ok(Value::Host(HostValue::TorchLayer(TorchLayerKind::Relu)))
             }
+            BuiltinFunction::Conv2dLayer => {
+                let [in_ch, out_ch, kernel] = expect_arity::<3>("합성곱", args)?;
+                let in_ch = expect_int("합성곱", in_ch)?;
+                let out_ch = expect_int("합성곱", out_ch)?;
+                let kernel = expect_int("합성곱", kernel)?;
+                Ok(Value::Host(HostValue::TorchLayer(TorchLayerKind::Conv2d {
+                    in_channels: in_ch,
+                    out_channels: out_ch,
+                    kernel_size: kernel,
+                })))
+            }
             BuiltinFunction::SequentialNetwork => {
                 let [layers] = expect_arity::<1>("순차신경망", args)?;
                 self.build_sequential_network(layers)
@@ -970,6 +1025,22 @@ impl Interpreter {
                 let [left, right] = expect_arity::<2>("같은값개수", args)?;
                 self.count_equal(left, right)
             }
+            BuiltinFunction::LoadPretrainedModel => {
+                let [config] = expect_arity::<1>("사전학습모델", args)?;
+                self.build_pretrained_model(config)
+            }
+            BuiltinFunction::LoadImage => {
+                let [path] = expect_arity::<1>("이미지불러오기", args)?;
+                self.load_image(path)
+            }
+            BuiltinFunction::ClassifyImage => {
+                let [config] = expect_arity::<1>("이미지분류", args)?;
+                self.classify_image(config)
+            }
+            BuiltinFunction::BuildFineTuneModel => {
+                let [config] = expect_arity::<1>("파인튜닝모델", args)?;
+                self.build_finetune_model(config)
+            }
         }
     }
 
@@ -1018,6 +1089,24 @@ impl Interpreter {
                             Default::default(),
                         ));
                     }
+                    TorchLayerKind::Conv2d {
+                        in_channels,
+                        out_channels,
+                        kernel_size,
+                    } => {
+                        let name = format!("conv2d{index}");
+                        let config = nn::ConvConfig {
+                            padding: (kernel_size - 1) / 2,
+                            ..Default::default()
+                        };
+                        network = network.add(nn::conv2d(
+                            &path / name,
+                            in_channels,
+                            out_channels,
+                            kernel_size,
+                            config,
+                        ));
+                    }
                 }
             }
 
@@ -1039,6 +1128,15 @@ impl Interpreter {
         {
             let record = expect_record("숫자손글씨데이터셋", config)?;
             let is_train = expect_bool_field(&record, "학습용")?;
+            let is_2d = match record.get("형태") {
+                Some(Value::String(s)) if s == "2차원" => true,
+                Some(Value::String(s)) => {
+                    return Err(RuntimeError::new(format!(
+                        "`형태`는 \"2차원\"만 지원합니다. 받은 값: \"{s}\""
+                    )));
+                }
+                _ => false,
+            };
             let device = self.torch_device();
             if self.mnist_cache.is_none() {
                 self.mnist_cache = Some(load_mnist_bundle()?);
@@ -1051,8 +1149,14 @@ impl Interpreter {
                     (mnist.test_images.shallow_clone(), mnist.test_labels.shallow_clone())
                 }
             };
+            let images = images.to_device(device).to_kind(Kind::Float);
+            let images = if is_2d {
+                images.view([-1, 1, 28, 28])
+            } else {
+                images
+            };
             Ok(self.register_dataset(TorchDataset {
-                images: images.to_device(device).to_kind(Kind::Float),
+                images,
                 labels: labels.to_device(device).to_kind(Kind::Int64),
             }))
         }
@@ -1110,30 +1214,67 @@ impl Interpreter {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let model_id = match parameters {
-                Value::Host(HostValue::TorchModelParameters(id))
-                | Value::Host(HostValue::TorchModel(id)) => id,
-                _ => {
-                    return Err(RuntimeError::new(
-                        "`아담`의 첫 번째 인수는 모델의 `매개변수`여야 합니다.",
-                    ));
-                }
-            };
             let learning_rate = expect_float("아담", learning_rate)?;
             if learning_rate <= 0.0 {
                 return Err(RuntimeError::new("학습률은 0보다 커야 합니다."));
             }
 
-            let model = self
-                .torch_models
-                .get(model_id)
-                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
-            let model_ref = model.borrow();
-            let optimizer = nn::Adam::default()
-                .build(&model_ref.var_store, learning_rate)
-                .map_err(|err| RuntimeError::new(format!("아담 최적화기 생성 실패: {err}")))?;
-            drop(model_ref);
-            Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+            match parameters {
+                Value::Host(HostValue::TorchModelParameters(id))
+                | Value::Host(HostValue::TorchModel(id)) => {
+                    let model = self
+                        .torch_models
+                        .get(id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+                    let model_ref = model.borrow();
+                    let optimizer = nn::Adam::default()
+                        .build(&model_ref.var_store, learning_rate)
+                        .map_err(|err| {
+                            RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
+                        })?;
+                    drop(model_ref);
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                }
+                Value::Host(HostValue::TorchPretrainedModelParameters(id))
+                | Value::Host(HostValue::TorchPretrainedModel(id)) => {
+                    let pretrained = self
+                        .torch_pretrained_models
+                        .get(id)
+                        .ok_or_else(|| {
+                            RuntimeError::new("유효하지 않은 사전학습모델입니다.")
+                        })?;
+                    let optimizer = nn::Adam::default()
+                        .build(&pretrained.var_store, learning_rate)
+                        .map_err(|err| {
+                            RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
+                        })?;
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                }
+                Value::Host(HostValue::TorchFineTuneModel(ft_id)) => {
+                    let ft = self
+                        .torch_finetune_models
+                        .get(ft_id)
+                        .ok_or_else(|| {
+                            RuntimeError::new("유효하지 않은 파인튜닝모델입니다.")
+                        })?;
+                    let head_id = ft.head_id;
+                    let head = self
+                        .torch_models
+                        .get(head_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 헤드입니다."))?;
+                    let head_ref = head.borrow();
+                    let optimizer = nn::Adam::default()
+                        .build(&head_ref.var_store, learning_rate)
+                        .map_err(|err| {
+                            RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
+                        })?;
+                    drop(head_ref);
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                }
+                _ => Err(RuntimeError::new(
+                    "`아담`의 첫 번째 인수는 모델의 `매개변수`여야 합니다.",
+                )),
+            }
         }
     }
 
@@ -1163,19 +1304,68 @@ impl Interpreter {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let model_id = expect_model_id(model)?;
             let input_tensor = expect_tensor("순전파", input)?;
-            let model_cell = self
-                .torch_models
-                .get(model_id)
-                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
-            let model = model_cell.borrow();
-            let logits = if model.is_training {
-                model.network.forward(&input_tensor)
-            } else {
-                no_grad(|| model.network.forward(&input_tensor))
-            };
-            Ok(Self::wrap_tensor(logits))
+            match model {
+                Value::Host(HostValue::TorchModel(model_id)) => {
+                    let model_cell = self
+                        .torch_models
+                        .get(model_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+                    let model = model_cell.borrow();
+                    let logits = if model.is_training {
+                        model.network.forward(&input_tensor)
+                    } else {
+                        no_grad(|| model.network.forward(&input_tensor))
+                    };
+                    Ok(Self::wrap_tensor(logits))
+                }
+                Value::Host(HostValue::TorchPretrainedModel(model_id)) => {
+                    let pretrained = self
+                        .torch_pretrained_models
+                        .get(model_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 사전학습모델입니다."))?;
+                    let is_training = pretrained.is_training;
+                    let logits = if is_training {
+                        pretrained.network.0.forward_t(&input_tensor, true)
+                    } else {
+                        no_grad(|| pretrained.network.0.forward_t(&input_tensor, false))
+                    };
+                    Ok(Self::wrap_tensor(logits))
+                }
+                Value::Host(HostValue::TorchFineTuneModel(ft_id)) => {
+                    let ft = self
+                        .torch_finetune_models
+                        .get(ft_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 파인튜닝모델입니다."))?;
+                    let backbone_id = ft.backbone_id;
+                    let head_id = ft.head_id;
+
+                    let adapted = adapt_input_for_imagenet(&input_tensor);
+
+                    let backbone = self
+                        .torch_pretrained_models
+                        .get(backbone_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 백본입니다."))?;
+                    let features = no_grad(|| {
+                        backbone.network.0.forward_t(&adapted, false)
+                    });
+
+                    let head_cell = self
+                        .torch_models
+                        .get(head_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 헤드입니다."))?;
+                    let head = head_cell.borrow();
+                    let logits = if head.is_training {
+                        head.network.forward(&features)
+                    } else {
+                        no_grad(|| head.network.forward(&features))
+                    };
+                    Ok(Self::wrap_tensor(logits))
+                }
+                _ => Err(RuntimeError::new(
+                    "`순전파`의 첫 번째 인수는 모델이어야 합니다.",
+                )),
+            }
         }
     }
 
@@ -1249,13 +1439,42 @@ impl Interpreter {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let model_id = expect_model_id(model)?;
-            let model = self
-                .torch_models
-                .get(model_id)
-                .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
-            model.borrow_mut().is_training = is_training;
-            Ok(Value::None)
+            match model {
+                Value::Host(HostValue::TorchModel(id)) => {
+                    let model = self
+                        .torch_models
+                        .get(id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 모델입니다."))?;
+                    model.borrow_mut().is_training = is_training;
+                    Ok(Value::None)
+                }
+                Value::Host(HostValue::TorchPretrainedModel(id)) => {
+                    let pretrained = self
+                        .torch_pretrained_models
+                        .get_mut(id)
+                        .ok_or_else(|| {
+                            RuntimeError::new("유효하지 않은 사전학습모델입니다.")
+                        })?;
+                    pretrained.is_training = is_training;
+                    Ok(Value::None)
+                }
+                Value::Host(HostValue::TorchFineTuneModel(ft_id)) => {
+                    let ft = self
+                        .torch_finetune_models
+                        .get(ft_id)
+                        .ok_or_else(|| {
+                            RuntimeError::new("유효하지 않은 파인튜닝모델입니다.")
+                        })?;
+                    let head_id = ft.head_id;
+                    let head = self
+                        .torch_models
+                        .get(head_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 헤드입니다."))?;
+                    head.borrow_mut().is_training = is_training;
+                    Ok(Value::None)
+                }
+                _ => Err(RuntimeError::new("이 값은 모델이어야 합니다.")),
+            }
         }
     }
 
@@ -1321,6 +1540,230 @@ impl Interpreter {
             let right = expect_tensor("같은값개수", right)?;
             let count = left.eq_tensor(&right).sum(Kind::Int64).int64_value(&[]);
             Ok(Value::Int(count))
+        }
+    }
+
+    fn build_pretrained_model(&mut self, config: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            self.pytorch_unavailable()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let record = expect_record("사전학습모델", config)?;
+            let name = expect_string_field(&record, &["이름"])?;
+            let weights_path = match record.get("가중치") {
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => {
+                    return Err(RuntimeError::new(
+                        "`가중치` 필드는 문자열이어야 합니다.",
+                    ));
+                }
+                None => {
+                    let default_dir = Path::new("data/pretrained");
+                    default_dir.join(format!("{name}.ot")).to_string_lossy().into_owned()
+                }
+            };
+
+            let nclasses = match record.get("출력크기") {
+                Some(Value::Int(n)) if *n > 0 => *n,
+                Some(Value::Int(_)) => {
+                    return Err(RuntimeError::new("`출력크기`는 1 이상이어야 합니다."));
+                }
+                Some(_) => {
+                    return Err(RuntimeError::new("`출력크기`는 정수여야 합니다."));
+                }
+                None => imagenet::CLASS_COUNT,
+            };
+
+            let freeze_backbone = match record.get("고정") {
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(RuntimeError::new("`고정`은 참/거짓이어야 합니다."));
+                }
+                None => false,
+            };
+
+            let weights = Path::new(&weights_path);
+            if !weights.exists() {
+                download_pretrained_weights(&name, weights)?;
+            }
+
+            let device = self.torch_device();
+            let mut vs = nn::VarStore::new(device);
+            let net: Box<dyn ModuleT> = match name.as_str() {
+                "resnet18" => Box::new(resnet::resnet18(&vs.root(), nclasses)),
+                "resnet34" => Box::new(resnet::resnet34(&vs.root(), nclasses)),
+                "densenet121" => Box::new(densenet::densenet121(&vs.root(), nclasses)),
+                "vgg13" => Box::new(vgg::vgg13(&vs.root(), nclasses)),
+                "vgg16" => Box::new(vgg::vgg16(&vs.root(), nclasses)),
+                "vgg19" => Box::new(vgg::vgg19(&vs.root(), nclasses)),
+                "squeezenet1_0" => Box::new(squeezenet::v1_0(&vs.root(), nclasses)),
+                "squeezenet1_1" => Box::new(squeezenet::v1_1(&vs.root(), nclasses)),
+                "alexnet" => Box::new(alexnet::alexnet(&vs.root(), nclasses)),
+                "inception-v3" => Box::new(inception::v3(&vs.root(), nclasses)),
+                "mobilenet-v2" => Box::new(mobilenet::v2(&vs.root(), nclasses)),
+                other => {
+                    return Err(RuntimeError::new(format!(
+                        "지원하지 않는 모델 이름입니다: `{other}`. 사용 가능: resnet18, resnet34, densenet121, vgg13, vgg16, vgg19, squeezenet1_0, squeezenet1_1, alexnet, inception-v3, mobilenet-v2"
+                    )));
+                }
+            };
+
+            let skipped = load_weights_shape_checked(&mut vs, weights, device)?;
+
+            if freeze_backbone {
+                vs.freeze();
+                for (var_name, tensor) in vs.variables() {
+                    if skipped.contains(var_name.as_str()) {
+                        let _ = tensor.set_requires_grad(true);
+                    }
+                }
+            }
+
+            self.torch_pretrained_models.push(TorchPretrainedModel {
+                var_store: vs,
+                network: PretrainedNet(net),
+                is_training: false,
+            });
+            Ok(Value::Host(HostValue::TorchPretrainedModel(
+                self.torch_pretrained_models.len() - 1,
+            )))
+        }
+    }
+
+    fn load_image(&mut self, path: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            self.pytorch_unavailable()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path_str = match path {
+                Value::String(s) => s,
+                _ => {
+                    return Err(RuntimeError::new(
+                        "`이미지불러오기` 인수는 문자열(경로)이어야 합니다.",
+                    ));
+                }
+            };
+            let image = imagenet::load_image_and_resize224(&path_str).map_err(|err| {
+                RuntimeError::new(format!(
+                    "이미지를 불러오지 못했습니다: `{path_str}` - {err}"
+                ))
+            })?;
+            let device = self.torch_device();
+            Ok(Self::wrap_tensor(image.to_device(device)))
+        }
+    }
+
+    fn classify_image(&mut self, config: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            self.pytorch_unavailable()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let record = expect_record("이미지분류", config)?;
+
+            let model_id = match record.get("모델") {
+                Some(Value::Host(HostValue::TorchPretrainedModel(id))) => *id,
+                Some(_) => {
+                    return Err(RuntimeError::new(
+                        "`모델` 필드는 사전학습모델이어야 합니다.",
+                    ));
+                }
+                None => return Err(RuntimeError::new("`모델` 필드가 필요합니다.")),
+            };
+
+            let image = match record.get("이미지") {
+                Some(Value::Tensor(t)) => t.clone(),
+                Some(_) => {
+                    return Err(RuntimeError::new(
+                        "`이미지` 필드는 텐서(이미지불러오기 결과)여야 합니다.",
+                    ));
+                }
+                None => return Err(RuntimeError::new("`이미지` 필드가 필요합니다.")),
+            };
+
+            let top_k = match record.get("상위개수") {
+                Some(Value::Int(n)) if *n > 0 => *n,
+                Some(Value::Int(_)) => {
+                    return Err(RuntimeError::new(
+                        "`상위개수`는 1 이상의 정수여야 합니다.",
+                    ));
+                }
+                Some(_) => {
+                    return Err(RuntimeError::new("`상위개수`는 정수여야 합니다."));
+                }
+                None => 5,
+            };
+
+            let pretrained = self
+                .torch_pretrained_models
+                .get(model_id)
+                .ok_or_else(|| RuntimeError::new("유효하지 않은 사전학습모델입니다."))?;
+
+            let output = no_grad(|| {
+                pretrained
+                    .network
+                    .0
+                    .forward_t(&image.unsqueeze(0), false)
+                    .softmax(-1, Kind::Float)
+            });
+
+            let top = imagenet::top(&output, top_k);
+            let results: Vec<Value> = top
+                .iter()
+                .map(|(prob, class)| {
+                    let mut map = BTreeMap::new();
+                    map.insert("클래스".to_string(), Value::String(class.clone()));
+                    map.insert("확률".to_string(), Value::Float(*prob * 100.0));
+                    Value::Record(Rc::new(RefCell::new(map)))
+                })
+                .collect();
+
+            Ok(Value::List(Rc::new(RefCell::new(results))))
+        }
+    }
+
+    fn build_finetune_model(&mut self, config: Value) -> Result<Value, RuntimeError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            self.pytorch_unavailable()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let record = expect_record("파인튜닝모델", config)?;
+            let backbone_id = match record.get("백본") {
+                Some(Value::Host(HostValue::TorchPretrainedModel(id))) => *id,
+                Some(_) => {
+                    return Err(RuntimeError::new(
+                        "`백본` 필드는 사전학습모델이어야 합니다.",
+                    ));
+                }
+                None => return Err(RuntimeError::new("`백본` 필드가 필요합니다.")),
+            };
+            let head_id = match record.get("헤드") {
+                Some(Value::Host(HostValue::TorchModel(id))) => *id,
+                Some(_) => {
+                    return Err(RuntimeError::new(
+                        "`헤드` 필드는 순차신경망이어야 합니다.",
+                    ));
+                }
+                None => return Err(RuntimeError::new("`헤드` 필드가 필요합니다.")),
+            };
+
+            let ft_id = self.torch_finetune_models.len();
+            self.torch_finetune_models.push(TorchFineTuneModel {
+                backbone_id,
+                head_id,
+            });
+            Ok(Value::Host(HostValue::TorchFineTuneModel(ft_id)))
         }
     }
 
@@ -1453,6 +1896,22 @@ impl Interpreter {
                 "매개변수" => Ok(Value::Host(HostValue::TorchModelParameters(model_id))),
                 _ => Err(RuntimeError::new(format!(
                     "모델에는 `{}` 속성이 없습니다.",
+                    name
+                ))),
+            },
+            Value::Host(HostValue::TorchPretrainedModel(model_id)) => match name {
+                "매개변수" => Ok(Value::Host(HostValue::TorchPretrainedModelParameters(
+                    model_id,
+                ))),
+                _ => Err(RuntimeError::new(format!(
+                    "사전학습모델에는 `{}` 속성이 없습니다.",
+                    name
+                ))),
+            },
+            Value::Host(HostValue::TorchFineTuneModel(ft_id)) => match name {
+                "매개변수" => Ok(Value::Host(HostValue::TorchFineTuneModel(ft_id))),
+                _ => Err(RuntimeError::new(format!(
+                    "파인튜닝모델에는 `{}` 속성이 없습니다.",
                     name
                 ))),
             },
@@ -1795,6 +2254,9 @@ impl Value {
             Value::Host(HostValue::TorchLayer(TorchLayerKind::Linear { .. })) => {
                 "<레이어 선형층>".to_string()
             }
+            Value::Host(HostValue::TorchLayer(TorchLayerKind::Conv2d { .. })) => {
+                "<레이어 합성곱>".to_string()
+            }
             Value::Host(HostValue::TorchDataset(_)) => "<MNIST 데이터셋>".to_string(),
             Value::Host(HostValue::TorchDataLoader(_)) => "<데이터로더>".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1803,6 +2265,11 @@ impl Value {
             Value::Host(HostValue::TorchModelParameters(_)) => "<모델 매개변수>".to_string(),
             Value::Host(HostValue::TorchLossFunction(_)) => "<손실함수>".to_string(),
             Value::Host(HostValue::TorchOptimizer(_)) => "<최적화기>".to_string(),
+            Value::Host(HostValue::TorchPretrainedModel(_)) => "<사전학습모델>".to_string(),
+            Value::Host(HostValue::TorchPretrainedModelParameters(_)) => {
+                "<사전학습모델 매개변수>".to_string()
+            }
+            Value::Host(HostValue::TorchFineTuneModel(_)) => "<파인튜닝모델>".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::Tensor(_) => "<텐서>".to_string(),
         }
@@ -1837,6 +2304,11 @@ impl fmt::Display for BuiltinFunction {
             BuiltinFunction::FetchBatch => write!(f, "<내장 함수 배치가져오기>"),
             BuiltinFunction::ArgMax => write!(f, "<내장 함수 최대인덱스>"),
             BuiltinFunction::CountEqual => write!(f, "<내장 함수 같은값개수>"),
+            BuiltinFunction::Conv2dLayer => write!(f, "<내장 함수 합성곱>"),
+            BuiltinFunction::LoadPretrainedModel => write!(f, "<내장 함수 사전학습모델>"),
+            BuiltinFunction::LoadImage => write!(f, "<내장 함수 이미지불러오기>"),
+            BuiltinFunction::ClassifyImage => write!(f, "<내장 함수 이미지분류>"),
+            BuiltinFunction::BuildFineTuneModel => write!(f, "<내장 함수 파인튜닝모델>"),
         }
     }
 }
@@ -1869,6 +2341,11 @@ impl BuiltinFunction {
             BuiltinFunction::FetchBatch => "배치가져오기",
             BuiltinFunction::ArgMax => "최대인덱스",
             BuiltinFunction::CountEqual => "같은값개수",
+            BuiltinFunction::Conv2dLayer => "합성곱",
+            BuiltinFunction::LoadPretrainedModel => "사전학습모델",
+            BuiltinFunction::LoadImage => "이미지불러오기",
+            BuiltinFunction::ClassifyImage => "이미지분류",
+            BuiltinFunction::BuildFineTuneModel => "파인튜닝모델",
         }
     }
 }
@@ -1990,6 +2467,26 @@ fn install_builtins(env: &EnvRef) {
         "같은값개수".into(),
         Value::Function(FunctionValue::Builtin(BuiltinFunction::CountEqual)),
     );
+    env.values.insert(
+        "사전학습모델".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::LoadPretrainedModel)),
+    );
+    env.values.insert(
+        "이미지불러오기".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::LoadImage)),
+    );
+    env.values.insert(
+        "이미지분류".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::ClassifyImage)),
+    );
+    env.values.insert(
+        "합성곱".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::Conv2dLayer)),
+    );
+    env.values.insert(
+        "파인튜닝모델".into(),
+        Value::Function(FunctionValue::Builtin(BuiltinFunction::BuildFineTuneModel)),
+    );
     env.values
         .insert("그림판".into(), Value::Host(HostValue::Canvas));
 }
@@ -2049,12 +2546,6 @@ fn expect_float(name: &str, value: Value) -> Result<f64, RuntimeError> {
     }
 }
 
-fn expect_model_id(value: Value) -> Result<usize, RuntimeError> {
-    match value {
-        Value::Host(HostValue::TorchModel(id)) => Ok(id),
-        _ => Err(RuntimeError::new("이 값은 모델이어야 합니다.")),
-    }
-}
 
 fn expect_optimizer_id(value: Value) -> Result<usize, RuntimeError> {
     match value {
@@ -2355,6 +2846,149 @@ fn download_mnist_files(dir: &Path) -> Result<(), RuntimeError> {
     }
 
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pretrained_weight_url(name: &str) -> Option<&'static str> {
+    match name {
+        "resnet18" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/resnet18.ot"),
+        "resnet34" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/resnet34.ot"),
+        "densenet121" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/densenet121.ot"),
+        "vgg13" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/vgg13.ot"),
+        "vgg16" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/vgg16.ot"),
+        "vgg19" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/vgg19.ot"),
+        "squeezenet1_0" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/squeezenet1_0.ot"),
+        "squeezenet1_1" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/squeezenet1_1.ot"),
+        "alexnet" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/alexnet.ot"),
+        "inception-v3" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/inception-v3.ot"),
+        "mobilenet-v2" => Some("https://github.com/LaurentMazare/tch-rs/releases/download/mw/mobilenet-v2.ot"),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn download_pretrained_weights(name: &str, destination: &Path) -> Result<(), RuntimeError> {
+    let url = pretrained_weight_url(name).ok_or_else(|| {
+        RuntimeError::new(format!(
+            "모델 `{name}`의 가중치를 자동으로 내려받을 수 없습니다. `가중치` 경로를 직접 지정해 주세요."
+        ))
+    })?;
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            RuntimeError::new(format!(
+                "가중치 저장 디렉터리를 만들지 못했습니다: `{}` - {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    eprintln!("가중치를 내려받는 중입니다: {url}");
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|err| RuntimeError::new(format!("가중치 다운로드 클라이언트 생성 실패: {err}")))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|err| {
+            RuntimeError::new(format!(
+                "가중치 파일을 내려받지 못했습니다: `{name}` ({url}) - {err}"
+            ))
+        })?;
+
+    let bytes = response.bytes().map_err(|err| {
+        RuntimeError::new(format!(
+            "가중치 다운로드 응답을 읽지 못했습니다: `{name}` - {err}"
+        ))
+    })?;
+
+    let mut output = File::create(destination).map_err(|err| {
+        RuntimeError::new(format!(
+            "가중치 파일을 저장하지 못했습니다: `{}` - {err}",
+            destination.display()
+        ))
+    })?;
+    io::copy(&mut bytes.as_ref(), &mut output).map_err(|err| {
+        RuntimeError::new(format!(
+            "가중치 파일 쓰기에 실패했습니다: `{name}` - {err}"
+        ))
+    })?;
+
+    eprintln!("가중치 다운로드 완료: {}", destination.display());
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_weights_shape_checked(
+    vs: &mut nn::VarStore,
+    weights_path: &Path,
+    device: Device,
+) -> Result<std::collections::HashSet<String>, RuntimeError> {
+    let saved = Tensor::load_multi_with_device(weights_path, device).map_err(|err| {
+        RuntimeError::new(format!(
+            "가중치 파일을 불러오지 못했습니다: `{}` - {err}",
+            weights_path.display()
+        ))
+    })?;
+    let saved_map: std::collections::HashMap<String, Tensor> =
+        saved.into_iter().collect();
+
+    let mut skipped = std::collections::HashSet::new();
+    no_grad(|| {
+        for (name, mut var_tensor) in vs.variables() {
+            if let Some(src) = saved_map.get(name.as_str()) {
+                if var_tensor.size() == src.size() {
+                    var_tensor.copy_(src);
+                } else {
+                    skipped.insert(name);
+                }
+            } else {
+                skipped.insert(name);
+            }
+        }
+    });
+    Ok(skipped)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn adapt_input_for_imagenet(input: &Tensor) -> Tensor {
+    let dims = input.dim();
+    let size = input.size();
+
+    let input_4d = match dims {
+        2 => {
+            let batch = size[0];
+            let flat = size[1];
+            let side = (flat as f64).sqrt() as i64;
+            if side * side == flat {
+                input.view([batch, 1, side, side])
+            } else {
+                input.unsqueeze(1)
+            }
+        }
+        3 => input.unsqueeze(1),
+        4 => input.shallow_clone(),
+        _ => input.shallow_clone(),
+    };
+
+    let sz = input_4d.size();
+    let channels = sz[1];
+    let height = sz[2];
+    let width = sz[3];
+
+    let resized = if height != 224 || width != 224 {
+        input_4d.upsample_bilinear2d(&[224, 224], false, None, None)
+    } else {
+        input_4d
+    };
+
+    if channels == 1 {
+        resized.repeat(&[1, 3, 1, 1])
+    } else {
+        resized
+    }
 }
 
 fn expect_arity<const N: usize>(name: &str, args: Vec<Value>) -> Result<[Value; N], RuntimeError> {
