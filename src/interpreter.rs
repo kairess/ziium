@@ -18,7 +18,7 @@ use std::io::{self, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
@@ -127,6 +127,7 @@ pub enum HostValue {
     TorchPretrainedModel(usize),
     TorchPretrainedModelParameters(usize),
     TorchFineTuneModel(usize),
+    TorchFineTuneModelParameters(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +178,7 @@ struct TorchModel {
 #[derive(Debug)]
 struct TorchOptimizer {
     optimizer: nn::Optimizer,
+    backbone_optimizer: Option<nn::Optimizer>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -195,6 +197,7 @@ struct TorchPretrainedModel {
     var_store: nn::VarStore,
     network: PretrainedNet,
     is_training: bool,
+    is_frozen: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1233,7 +1236,7 @@ impl Interpreter {
                             RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
                         })?;
                     drop(model_ref);
-                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer, backbone_optimizer: None }))
                 }
                 Value::Host(HostValue::TorchPretrainedModelParameters(id))
                 | Value::Host(HostValue::TorchPretrainedModel(id)) => {
@@ -1248,9 +1251,10 @@ impl Interpreter {
                         .map_err(|err| {
                             RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
                         })?;
-                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer, backbone_optimizer: None }))
                 }
-                Value::Host(HostValue::TorchFineTuneModel(ft_id)) => {
+                Value::Host(HostValue::TorchFineTuneModel(ft_id))
+                | Value::Host(HostValue::TorchFineTuneModelParameters(ft_id)) => {
                     let ft = self
                         .torch_finetune_models
                         .get(ft_id)
@@ -1258,6 +1262,7 @@ impl Interpreter {
                             RuntimeError::new("유효하지 않은 파인튜닝모델입니다.")
                         })?;
                     let head_id = ft.head_id;
+                    let backbone_id = ft.backbone_id;
                     let head = self
                         .torch_models
                         .get(head_id)
@@ -1269,7 +1274,22 @@ impl Interpreter {
                             RuntimeError::new(format!("아담 최적화기 생성 실패: {err}"))
                         })?;
                     drop(head_ref);
-                    Ok(self.register_optimizer(TorchOptimizer { optimizer }))
+                    let backbone = self
+                        .torch_pretrained_models
+                        .get(backbone_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 백본입니다."))?;
+                    let backbone_optimizer = if !backbone.is_frozen {
+                        Some(
+                            nn::Adam::default()
+                                .build(&backbone.var_store, learning_rate)
+                                .map_err(|err| {
+                                    RuntimeError::new(format!("백본 최적화기 생성 실패: {err}"))
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok(self.register_optimizer(TorchOptimizer { optimizer, backbone_optimizer }))
                 }
                 _ => Err(RuntimeError::new(
                     "`아담`의 첫 번째 인수는 모델의 `매개변수`여야 합니다.",
@@ -1291,7 +1311,11 @@ impl Interpreter {
                 .torch_optimizers
                 .get(optimizer_id)
                 .ok_or_else(|| RuntimeError::new("유효하지 않은 최적화기입니다."))?;
-            optimizer.borrow_mut().optimizer.zero_grad();
+            let mut opt = optimizer.borrow_mut();
+            opt.optimizer.zero_grad();
+            if let Some(backbone_opt) = &mut opt.backbone_optimizer {
+                backbone_opt.zero_grad();
+            }
             Ok(Value::None)
         }
     }
@@ -1346,9 +1370,12 @@ impl Interpreter {
                         .torch_pretrained_models
                         .get(backbone_id)
                         .ok_or_else(|| RuntimeError::new("유효하지 않은 백본입니다."))?;
-                    let features = no_grad(|| {
-                        backbone.network.0.forward_t(&adapted, false)
-                    });
+                    let backbone_training = backbone.is_training;
+                    let features = if backbone.is_frozen {
+                        no_grad(|| backbone.network.0.forward_t(&adapted, false))
+                    } else {
+                        backbone.network.0.forward_t(&adapted, backbone_training)
+                    };
 
                     let head_cell = self
                         .torch_models
@@ -1426,7 +1453,11 @@ impl Interpreter {
                 .torch_optimizers
                 .get(optimizer_id)
                 .ok_or_else(|| RuntimeError::new("유효하지 않은 최적화기입니다."))?;
-            optimizer.borrow_mut().optimizer.step();
+            let mut opt = optimizer.borrow_mut();
+            opt.optimizer.step();
+            if let Some(backbone_opt) = &mut opt.backbone_optimizer {
+                backbone_opt.step();
+            }
             Ok(Value::None)
         }
     }
@@ -1466,11 +1497,17 @@ impl Interpreter {
                             RuntimeError::new("유효하지 않은 파인튜닝모델입니다.")
                         })?;
                     let head_id = ft.head_id;
+                    let backbone_id = ft.backbone_id;
                     let head = self
                         .torch_models
                         .get(head_id)
                         .ok_or_else(|| RuntimeError::new("유효하지 않은 헤드입니다."))?;
                     head.borrow_mut().is_training = is_training;
+                    let backbone = self
+                        .torch_pretrained_models
+                        .get_mut(backbone_id)
+                        .ok_or_else(|| RuntimeError::new("유효하지 않은 백본입니다."))?;
+                    backbone.is_training = is_training;
                     Ok(Value::None)
                 }
                 _ => Err(RuntimeError::new("이 값은 모델이어야 합니다.")),
@@ -1626,6 +1663,7 @@ impl Interpreter {
                 var_store: vs,
                 network: PretrainedNet(net),
                 is_training: false,
+                is_frozen: freeze_backbone,
             });
             Ok(Value::Host(HostValue::TorchPretrainedModel(
                 self.torch_pretrained_models.len() - 1,
@@ -1909,7 +1947,7 @@ impl Interpreter {
                 ))),
             },
             Value::Host(HostValue::TorchFineTuneModel(ft_id)) => match name {
-                "매개변수" => Ok(Value::Host(HostValue::TorchFineTuneModel(ft_id))),
+                "매개변수" => Ok(Value::Host(HostValue::TorchFineTuneModelParameters(ft_id))),
                 _ => Err(RuntimeError::new(format!(
                     "파인튜닝모델에는 `{}` 속성이 없습니다.",
                     name
@@ -2270,6 +2308,7 @@ impl Value {
                 "<사전학습모델 매개변수>".to_string()
             }
             Value::Host(HostValue::TorchFineTuneModel(_)) => "<파인튜닝모델>".to_string(),
+            Value::Host(HostValue::TorchFineTuneModelParameters(_)) => "<파인튜닝모델 매개변수>".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::Tensor(_) => "<텐서>".to_string(),
         }
@@ -2760,22 +2799,24 @@ fn select_torch_device() -> Device {
 #[cfg(not(target_arch = "wasm32"))]
 fn load_mnist_bundle() -> Result<tch::vision::dataset::Dataset, RuntimeError> {
     let download_dir = Path::new("data/MNIST/raw");
-    let last_error = if download_dir.exists() {
-        tch::vision::mnist::load_dir(download_dir)
-            .err()
-            .map(|err| (download_dir.display().to_string(), err))
+
+    let load_failed = if download_dir.exists() {
+        match tch::vision::mnist::load_dir(download_dir) {
+            Ok(dataset) => return Ok(dataset),
+            Err(err) => Some(err),
+        }
     } else {
         None
     };
 
     download_mnist_files(download_dir).map_err(|download_err| {
-        let download_dir = download_dir.display();
-        match &last_error {
-            Some((dir, err)) => RuntimeError::new(format!(
-                "MNIST 데이터를 `{download_dir}`에서 불러오지 못해 자동 다운로드를 시도했지만 실패했습니다. 마지막 실패: `{dir}` - {err}, 다운로드 오류: {download_err}"
+        let dir = download_dir.display();
+        match &load_failed {
+            Some(err) => RuntimeError::new(format!(
+                "MNIST 데이터를 `{dir}`에서 불러오지 못해 자동 다운로드를 시도했지만 실패했습니다. 마지막 실패: `{dir}` - {err}, 다운로드 오류: {download_err}"
             )),
             None => RuntimeError::new(format!(
-                "MNIST 데이터가 `{download_dir}`에 없어 자동 다운로드를 시도했지만 실패했습니다. 다운로드 오류: {download_err}"
+                "MNIST 데이터가 `{dir}`에 없어 자동 다운로드를 시도했지만 실패했습니다. 다운로드 오류: {download_err}"
             )),
         }
     })?;
@@ -2832,15 +2873,25 @@ fn download_mnist_files(dir: &Path) -> Result<(), RuntimeError> {
         })?;
 
         let mut decoder = GzDecoder::new(bytes.as_ref());
-        let mut output = File::create(&destination).map_err(|err| {
+        let tmp_path = dir.join(format!("{file_name}.tmp"));
+        let mut output = File::create(&tmp_path).map_err(|err| {
+            RuntimeError::new(format!(
+                "MNIST 임시 파일을 만들지 못했습니다. `{}` - {err}",
+                tmp_path.display()
+            ))
+        })?;
+        if let Err(err) = std::io::copy(&mut decoder, &mut output) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(RuntimeError::new(format!(
+                "MNIST 압축 해제에 실패했습니다. `{file_name}` - {err}"
+            )));
+        }
+        drop(output);
+        fs::rename(&tmp_path, &destination).map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
             RuntimeError::new(format!(
                 "MNIST 파일을 저장하지 못했습니다. `{}` - {err}",
                 destination.display()
-            ))
-        })?;
-        std::io::copy(&mut decoder, &mut output).map_err(|err| {
-            RuntimeError::new(format!(
-                "MNIST 압축 해제에 실패했습니다. `{file_name}` - {err}"
             ))
         })?;
     }
@@ -2904,15 +2955,25 @@ fn download_pretrained_weights(name: &str, destination: &Path) -> Result<(), Run
         ))
     })?;
 
-    let mut output = File::create(destination).map_err(|err| {
+    let tmp_path = PathBuf::from(format!("{}.tmp", destination.display()));
+    let mut output = File::create(&tmp_path).map_err(|err| {
+        RuntimeError::new(format!(
+            "가중치 임시 파일을 만들지 못했습니다: `{}` - {err}",
+            tmp_path.display()
+        ))
+    })?;
+    if let Err(err) = io::copy(&mut bytes.as_ref(), &mut output) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(RuntimeError::new(format!(
+            "가중치 파일 쓰기에 실패했습니다: `{name}` - {err}"
+        )));
+    }
+    drop(output);
+    fs::rename(&tmp_path, destination).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
         RuntimeError::new(format!(
             "가중치 파일을 저장하지 못했습니다: `{}` - {err}",
             destination.display()
-        ))
-    })?;
-    io::copy(&mut bytes.as_ref(), &mut output).map_err(|err| {
-        RuntimeError::new(format!(
-            "가중치 파일 쓰기에 실패했습니다: `{name}` - {err}"
         ))
     })?;
 
@@ -2965,7 +3026,7 @@ fn adapt_input_for_imagenet(input: &Tensor) -> Tensor {
             if side * side == flat {
                 input.view([batch, 1, side, side])
             } else {
-                input.unsqueeze(1)
+                input.view([batch, 1, 1, flat])
             }
         }
         3 => input.unsqueeze(1),
